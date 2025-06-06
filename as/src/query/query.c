@@ -229,14 +229,14 @@ throttle_sleep(as_query_job* _job)
 int
 as_query(as_transaction* tr, as_namespace* ns)
 {
-	switch (get_query_type(tr)) {
-	case QUERY_TYPE_BASIC:
+	switch (get_query_type(tr)) { //查询类型
+	case QUERY_TYPE_BASIC: //普通查询任务
 		return basic_query_job_start(tr, ns);
-	case QUERY_TYPE_AGGR:
+	case QUERY_TYPE_AGGR:	//聚合查询任务
 		return aggr_query_job_start(tr, ns);
-	case QUERY_TYPE_UDF_BG:
+	case QUERY_TYPE_UDF_BG: //后台udf查询任务
 		return udf_bg_query_job_start(tr, ns);
-	case QUERY_TYPE_OPS_BG:
+	case QUERY_TYPE_OPS_BG: //后台操作查询
 		return ops_bg_query_job_start(tr, ns);
 	default:
 		return AS_ERR_PARAMETER;
@@ -1471,21 +1471,21 @@ basic_query_job_start(as_transaction* tr, as_namespace* ns)
 	as_msg* m = &tr->msgp->msg;
 
 	// TODO - phase out now? Or if/when future clients stop sending bit?
-	if ((m->info3 & AS_MSG_INFO3_PARTITION_DONE) == 0) {
+	if ((m->info3 & AS_MSG_INFO3_PARTITION_DONE) == 0) { //兼容性检查   老版本协议不支持
 		cf_warning(AS_QUERY, "basic query expects unsupported pid-done-ok");
 		return AS_ERR_UNSUPPORTED_FEATURE;
 	}
 
-	basic_query_job* job = cf_calloc(1, sizeof(basic_query_job));
-	conn_query_job* conn_job = (conn_query_job*)job;
+	basic_query_job* job = cf_calloc(1, sizeof(basic_query_job)); 	//分配内存
+	conn_query_job* conn_job = (conn_query_job*)job;				//类型转换
 	as_query_job* _job = (as_query_job*)job;
 
 	// Short queries only for basic queries, but use base job member.
-	if (as_transaction_is_short_query(tr) && ! ns->force_long_queries) {
+	if (as_transaction_is_short_query(tr) && ! ns->force_long_queries) { //短查询
 		_job->is_short = true;
 		_job->do_inline = ns->inline_short_queries;
 	}
-	else {
+	else { //长查询
 		_job->relax = (m->info2 & AS_MSG_INFO2_RELAX_AP_LONG_QUERY) != 0;
 
 		if (_job->relax && ns->cp) {
@@ -1495,50 +1495,50 @@ basic_query_job_start(as_transaction* tr, as_namespace* ns)
 		}
 	}
 
-	as_query_job_init(_job, &basic_query_job_vtable, tr, ns);
+	as_query_job_init(_job, &basic_query_job_vtable, tr, ns); 	//初始化query_job 函数赋值
 
-	if (! get_query_set(tr, ns, _job->set_name, &_job->set_id) ||
+	if (! get_query_set(tr, ns, _job->set_name, &_job->set_id) || //提取集群名和id
 			! get_query_pids(tr, &_job->pids, &_job->n_pids_requested,
-					&_job->n_keyds_requested) ||
-			! get_query_range(tr, ns, &_job->range) ||
-			! get_query_rps(tr, &_job->rps)) {
+					&_job->n_keyds_requested) ||	//提取分区id或key digest列表
+			! get_query_range(tr, ns, &_job->range) ||	//索引范围查询
+			! get_query_rps(tr, &_job->rps)) {	//请求速率限制 
 		cf_warning(AS_QUERY, "basic query job failed msg field processing");
 		as_query_job_destroy(_job);
 		return AS_ERR_PARAMETER;
 	}
 
 	// TODO - roll into above, return AS_ERR_PARAMETER?
-	if (_job->pids == NULL) {
+	if (_job->pids == NULL) { //无分区信息
 		cf_warning(AS_QUERY, "basic query missing pids and digests fields");
 		as_query_job_destroy(_job);
 		return AS_ERR_UNSUPPORTED_FEATURE;
 	}
 
-	if (! find_sindex(_job)) {
+	if (! find_sindex(_job)) { //查找二级索引
 		as_query_job_destroy(_job);
 		return AS_ERR_SINDEX_NOT_FOUND;
 	}
 
-	if (_job->si != NULL && ! _job->si->readable) {
+	if (_job->si != NULL && ! _job->si->readable) { //索引不可读
 		as_query_job_destroy(_job);
 		return AS_ERR_SINDEX_NOT_READABLE;
 	}
 
 	// Take ownership of socket from transaction.
-	conn_query_job_init(conn_job, tr);
+	conn_query_job_init(conn_job, tr);	//初始化连接相关结构
 
-	if (! get_query_socket_timeout(tr, &conn_job->fd_timeout)) {
+	if (! get_query_socket_timeout(tr, &conn_job->fd_timeout)) { //设置超时时间
 		cf_warning(AS_QUERY, "basic query job failed msg field processing");
 		conn_query_job_destroy(conn_job);
 		as_query_job_destroy(_job);
 		return AS_ERR_PARAMETER;
 	}
 
-	basic_query_job_init(job);
+	basic_query_job_init(job); //初始化job
 
-	if (! get_query_sample_max(tr, &job->sample_max) ||
-			! basic_query_get_bin_names(tr, ns, &job->bin_names) ||
-			! get_query_filter_exp(tr, &job->filter_exp)) {
+	if (! get_query_sample_max(tr, &job->sample_max) || //最大返回记录数
+			! basic_query_get_bin_names(tr, ns, &job->bin_names) || //返回bin字段列表
+			! get_query_filter_exp(tr, &job->filter_exp)) { //表达式过滤条件
 		cf_warning(AS_QUERY, "basic query job failed msg field processing");
 		conn_query_job_destroy(conn_job);
 		as_query_job_destroy(_job);
@@ -1548,7 +1548,7 @@ basic_query_job_start(as_transaction* tr, as_namespace* ns)
 	job->no_bin_data = (m->info1 & AS_MSG_INFO1_GET_NO_BINS) != 0;
 
 	int result = as_security_check_rps(tr->from.proto_fd_h, _job->rps,
-			PERM_QUERY, false, &_job->rps_udata);
+			PERM_QUERY, false, &_job->rps_udata); //校验是否有执行查询的权限
 
 	if (result != AS_OK) {
 		cf_warning(AS_QUERY, "basic query job failed quota %d", result);
@@ -1557,8 +1557,8 @@ basic_query_job_start(as_transaction* tr, as_namespace* ns)
 		return result;
 	}
 
-	if (_job->is_short) {
-		if (m->transaction_ttl != 0) {
+	if (_job->is_short) {//设置短查询截止时间
+		if (m->transaction_ttl != 0) { 
 			job->end_ns = tr->start_time +
 					((uint64_t)m->transaction_ttl * 1000000);
 		}
@@ -1575,7 +1575,7 @@ basic_query_job_start(as_transaction* tr, as_namespace* ns)
 				conn_job->fd_timeout, _job->client);
 	}
 
-	result = as_query_manager_start_job(_job);
+	result = as_query_manager_start_job(_job); //最终将查询任务提交给查询引擎异步执行
 
 	if (result != AS_OK) {
 		cf_warning(AS_QUERY, "basic query job %lu failed to start (%d)",
@@ -1598,19 +1598,19 @@ basic_query_job_slice(as_query_job* _job, as_partition_reservation* rsv,
 {
 	basic_query_job* job = (basic_query_job*)_job;
 
-	if (*bb_r == NULL) {
-		*bb_r = cf_buf_builder_create(INIT_BUF_BUILDER_SIZE);
-		cf_buf_builder_reserve(bb_r, (int)sizeof(as_proto), NULL);
+	if (*bb_r == NULL) { //创建一个新的缓冲构建器 打包响应消息
+		*bb_r = cf_buf_builder_create(INIT_BUF_BUILDER_SIZE); 
+		cf_buf_builder_reserve(bb_r, (int)sizeof(as_proto), NULL); //为as_proto预留空间
 	}
-	else if (rsv == NULL) { // this thread finished all its partitions
-		if (_job->is_short) {
+	else if (rsv == NULL) { //所有分区处理完成 // this thread finished all its partitions
+		if (_job->is_short) { // 短查询 标记结束
 			as_msg_fin_bufbuilder(bb_r, _job->abandoned);
 			// Won't send fin later in finish().
 		}
 
 		cf_buf_builder* bb = *bb_r;
 
-		if (bb->used_sz > sizeof(as_proto)) {
+		if (bb->used_sz > sizeof(as_proto)) { //buffer不为空 发送剩余数据
 			conn_query_job_send_response((conn_query_job*)job, bb->buf,
 					bb->used_sz);
 		}
@@ -1618,50 +1618,50 @@ basic_query_job_slice(as_query_job* _job, as_partition_reservation* rsv,
 		return;
 	}
 
-	as_index_tree* tree = rsv->tree;
+	as_index_tree* tree = rsv->tree; //索引树
 
-	if (tree == NULL) {
+	if (tree == NULL) { //分区没有可用的索引树  返回错误
 		as_msg_pid_done_bufbuilder(bb_r, rsv->p->id, AS_ERR_UNAVAILABLE);
 		return;
 	}
 
-	if (_job->set_id == INVALID_SET_ID && _job->set_name[0] != '\0') {
+	if (_job->set_id == INVALID_SET_ID && _job->set_name[0] != '\0') { //集合检查 （集群名存在但是id无效） 跳过这个分区
 		return;
 	}
 
 	uint64_t slice_start = cf_getns();
 
-	if (_job->is_short && slice_start > job->end_ns) {
+	if (_job->is_short && slice_start > job->end_ns) { //超时检查
 		as_query_manager_abandon_job(_job, AS_ERR_TIMEOUT);
 		return;
 	}
 
-	basic_query_slice slice = { job, bb_r };
+	basic_query_slice slice = { job, bb_r }; //回调上下文
 
-	if (job->sample_max == 0 || job->sample_count < job->sample_max) {
-		int64_t bval = 0;
-		cf_digest* keyd = NULL;
+	if (job->sample_max == 0 || job->sample_count < job->sample_max) { //未达到最大返回记录数
+		int64_t bval = 0;		//二级索引值
+		cf_digest* keyd = NULL;	//digest值
 		as_query_pid* qp = &_job->pids[rsv->p->id];
 
-		if (qp->has_resume) {
+		if (qp->has_resume) { //是否需要从上次中断位置继续扫描
 			bval = qp->bval;
 			keyd = &qp->keyd;
 		}
 
-		if (_job->si != NULL) {
+		if (_job->si != NULL) { //二级索引查询
 			as_sindex_tree_query(_job->si, _job->range, rsv, bval, keyd,
 					basic_query_job_reduce_cb, (void*)&slice);
 		}
-		else {
+		else { //无二级索引
 			if (! as_set_index_reduce(_job->ns, tree, _job->set_id, keyd,
-					basic_pi_query_job_reduce_cb, (void*)&slice)) {
+					basic_pi_query_job_reduce_cb, (void*)&slice)) { //尝试按集合过滤  ,失败则全量遍历
 				as_index_reduce_from(tree, keyd, basic_pi_query_job_reduce_cb,
-						(void*)&slice);
+						(void*)&slice); //遍历整个索引树
 			}
 		}
 	}
 
-	if (! _job->is_short) {
+	if (! _job->is_short) { //长查询打印下记录  性能监控 
 		cf_detail(AS_QUERY, "basic query job %lu pid %u took %lu us",
 				_job->trid, rsv->p->id, (cf_getns() - slice_start) / 1000);
 	}

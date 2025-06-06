@@ -201,7 +201,7 @@ static void validate_smd_directory(void);
 int
 as_run(int argc, char **argv)
 {
-	g_start_sec = cf_get_seconds();
+	g_start_sec = cf_get_seconds(); //开始时间
 
 	int opt;
 	int opt_i;
@@ -215,18 +215,18 @@ as_run(int argc, char **argv)
 	// Parse command line options.
 	while ((opt = getopt_long(argc, argv, "", CMD_OPTS, &opt_i)) != -1) {
 		switch (opt) {
-		case 'h':
+		case 'h': //显示帮助信息
 			// printf() since we want stdout and don't want cf_log's prefix.
 			printf("%s\n", HELP);
 			return 0;
-		case 'v':
+		case 'v': //显示版本信息
 			// printf() since we want stdout and don't want cf_log's prefix.
 			printf("%s build %s\n", aerospike_build_type, aerospike_build_id);
 			return 0;
-		case 'f':
+		case 'f': //指定配置文件路径
 			config_file = cf_strdup(optarg);
 			break;
-		case 'F':
+		case 'F': //新风格守护进程模式  不写PID文件等
 			// As a "new-style" daemon(*), asd runs in the foreground and
 			// ignores the following configuration items:
 			//  - user ('user')
@@ -240,16 +240,16 @@ as_run(int argc, char **argv)
 			run_in_foreground = true;
 			new_style_daemon = true;
 			break;
-		case 'd':
+		case 'd': //在前台运行 不daemonize
 			run_in_foreground = true;
 			break;
-		case 'e':
+		case 'e': //提前启动verbose日志输出
 			early_verbose = true;
 			break;
-		case 'c':
+		case 'c': //冷启动 忽略持久化数据
 			cold_start_cmd = true;
 			break;
-		case 'n':
+		case 'n': //设置实例编号 用于numa节点绑定
 			instance = (uint32_t)strtol(optarg, NULL, 0);
 			break;
 		default:
@@ -260,13 +260,13 @@ as_run(int argc, char **argv)
 	}
 
 	// Initializations before config parsing.
-	cf_log_init(early_verbose);
-	cf_alloc_init();
-	cf_trace_init();
-	cf_thread_init();
-	as_signal_setup();
-	cf_fips_init();
-	cf_tls_init();
+	cf_log_init(early_verbose); //日志
+	cf_alloc_init();			//内存分配器
+	cf_trace_init();			//追踪
+	cf_thread_init();			//线程
+	as_signal_setup();			//信号
+	cf_fips_init();				//fips
+	cf_tls_init();				//tls
 
 	// Set all fields in the global runtime configuration instance. This parses
 	// the configuration file, and creates as_namespace objects. (Return value
@@ -275,14 +275,14 @@ as_run(int argc, char **argv)
 
 	// Detect NUMA topology and, if requested, prepare for CPU and NUMA pinning.
 	cf_topo_config(c->auto_pin, (cf_topo_numa_node_index)instance,
-			&c->service.bind);
+			&c->service.bind); //自动绑定cpu和numa节点
 
 	// Perform privilege separation as necessary. If configured user & group
 	// don't have root privileges, all resources created or reopened past this
 	// point must be set up so that they are accessible without root privileges.
 	// If not, the process will self-terminate with (hopefully!) a log message
 	// indicating which resource is not set up properly.
-	cf_process_privsep(c->uid, c->gid);
+	cf_process_privsep(c->uid, c->gid); //切换到指定用户、组身份运行权限隔离
 
 	//
 	// All resources such as files, devices, and shared memory must be created
@@ -296,12 +296,12 @@ as_run(int argc, char **argv)
 	// specified filtering. If console sink is specified in configuration, 'cf_'
 	// log output will continue going to stderr, but filtering will switch to
 	// that specified in console sink configuration.
-	cf_log_activate_sinks();
+	cf_log_activate_sinks(); //重定向日志输出
 
 	// Daemonize asd if specified. After daemonization, output to stderr will no
 	// longer appear in terminal. Instead, check /tmp/aerospike-console.<pid>
 	// for console output.
-	if (! run_in_foreground && c->run_as_daemon) {
+	if (! run_in_foreground && c->run_as_daemon) { //守护进程化 fork
 		cf_process_daemonize();
 	}
 
@@ -319,7 +319,7 @@ as_run(int argc, char **argv)
 
 	// Write the pid file, if specified.
 	if (! new_style_daemon) {
-		write_pidfile(c->pidfile);
+		write_pidfile(c->pidfile); //当前进程写入pidfile
 	}
 	else {
 		if (c->pidfile != NULL) {
@@ -328,50 +328,50 @@ as_run(int argc, char **argv)
 	}
 
 	// Check that required directories are set up properly.
-	validate_directory(c->work_directory, "work");
-	validate_directory(c->mod_lua.user_path, "Lua user");
+	validate_directory(c->work_directory, "work"); //目录验证 是否可读写
+	validate_directory(c->mod_lua.user_path, "Lua user"); 
 	validate_smd_directory();
 
 	// Initialize subsystems. At this point we're allocating local resources,
 	// starting worker threads, etc. (But no communication with other server
 	// nodes or clients yet.)
 
-	as_json_init();				// Jansson JSON API used by System Metadata
-	as_index_tree_gc_init();	// thread to purge dropped index trees
+	as_json_init();				//json模块初始化 // Jansson JSON API used by System Metadata
+	as_index_tree_gc_init();	//索引管理 // thread to purge dropped index trees
 	as_nsup_init();				// load previous evict-void-time(s)
-	as_xdr_init();				// load persisted last-ship-time(s)
-	as_roster_init();			// load roster-related SMD
+	as_xdr_init();				// xdr跨数据中心 // load persisted last-ship-time(s)
+	as_roster_init();			//集群元数据 // load roster-related SMD
 
 	// Set up namespaces. Each namespace decides here whether it will do a warm
 	// or cold start. Index arenas, set and bin name vmaps are initialized.
-	as_namespaces_setup(cold_start_cmd, instance);
+	as_namespaces_setup(cold_start_cmd, instance);  //命名空间设置
 
 	// These load SMD involving sets/bins, needed during storage init/load.
-	as_sindex_init();
+	as_sindex_init(); //二级索引
 	as_truncate_init();
 
 	// Initialize namespaces. Partition structures and index tree structures are
 	// initialized.
-	as_namespaces_init(cold_start_cmd, instance);
+	as_namespaces_init(cold_start_cmd, instance);  //命名空间初始化
 
 	// Initialize the storage system. For warm restarts, this includes fully
 	// resuming persisted indexes.
-	as_storage_init();
+	as_storage_init();	//初始化存储
 	// ... This could block for minutes ....................
 
 	// For warm restarts, fully resume persisted sindexes.
-	as_sindex_resume();
+	as_sindex_resume(); //恢复索引
 	// ... This could block for minutes ....................
 
 	// Migrate memory to correct NUMA node (includes resumed index arenas).
-	cf_topo_migrate_memory();
+	cf_topo_migrate_memory(); //迁移内存
 
 	// Drop capabilities that we kept only for initialization.
-	cf_process_drop_startup_caps();
+	cf_process_drop_startup_caps(); //删除功能
 
 	// For cold starts, this does full drive scans. (Also populates
 	// storage-engine memory & pmem namespaces' secondary indexes.)
-	as_storage_load();
+	as_storage_load();	//冷启动 全部扫描
 	// ... This could block for hours ......................
 
 	// Populate storage-engine device namespaces' secondary indexes.
@@ -380,14 +380,14 @@ as_run(int argc, char **argv)
 
 	// The defrag subsystem starts operating here. Wait for enough available
 	// storage.
-	as_storage_activate();
+	as_storage_activate();	//存储激活
 	// ... This could block for a while ....................
 
 	cf_info(AS_AS, "initializing services...");
 
 	cf_dns_init();				// DNS resolver
 	as_security_init();			// security features
-	as_service_init();			// server may process internal transactions
+	as_service_init();			//服务的线程 epoll // server may process internal transactions
 	as_hb_init();				// inter-node heartbeat
 	as_skew_monitor_init();		// clock skew monitor
 	as_fabric_init();			// inter-node communications
@@ -406,7 +406,7 @@ as_run(int argc, char **argv)
 	// Start subsystems. At this point we may begin communicating with other
 	// cluster nodes, and ultimately with clients.
 
-	cf_tls_start();				// starts tls certificate refresh thread
+	cf_tls_start();				// tls证书刷新线程启动 // starts tls certificate refresh thread
 	as_sindex_start();			// starts sindex GC threads
 	as_smd_start();				// enables receiving cluster state change events
 	as_health_start();			// starts before fabric and hb to capture them
@@ -416,9 +416,9 @@ as_run(int argc, char **argv)
 	as_exchange_start();		// start the cluster exchange subsystem
 	as_clustering_start();		// clustering-v5 start
 	as_nsup_start();			// may send evict-void-time(s) to other nodes
-	as_service_start();			// server will now receive client transactions
-	as_info_port_start();		// server will now receive info transactions
-	as_ticker_start();			// only after everything else is started
+	as_service_start();			// // server will now receive client transactions
+	as_info_port_start();		//info协议监听线程 // server will now receive info transactions
+	as_ticker_start();			// 定时任务启动// only after everything else is started
 
 	// Relevant for enterprise edition only.
 	as_mrt_monitor_start();
@@ -436,7 +436,7 @@ as_run(int argc, char **argv)
 	// a remarkably efficient way to do this.
 	pthread_mutex_lock(&g_main_deadlock);
 	g_startup_complete = true;
-	pthread_mutex_lock(&g_main_deadlock);
+	pthread_mutex_lock(&g_main_deadlock);  //死锁等待关闭信号的到来
 
 	// When the service is running, you are here (deadlocked) - the signals that
 	// stop the service (yes, these signals always occur in this thread) will
@@ -454,16 +454,16 @@ as_run(int argc, char **argv)
 
 	// If this node was not quiesced and storage shutdown takes very long (e.g.
 	// flushing pmem index), best to get kicked out of the cluster quickly.
-	as_hb_shutdown();
+	as_hb_shutdown(); //关闭心跳
 
 	// Block partition rebalance to prevent new (non-null) partition trees from
 	// being swizzled in.
-	as_exchange_shutdown();
+	as_exchange_shutdown(); 
 
 	// Make sure committed SMD files are in sync with SMD callback activity.
-	as_smd_shutdown();
+	as_smd_shutdown();	//SMD
 
-	if (! as_storage_shutdown(instance)) {
+	if (! as_storage_shutdown(instance)) { //关闭存储系统
 		cf_warning(AS_AS, "failed clean shutdown - exiting");
 		_exit(1);
 	}

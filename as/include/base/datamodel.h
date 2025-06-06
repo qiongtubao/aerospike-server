@@ -561,21 +561,21 @@ typedef void (*as_index_value_destructor) (struct as_index_s* v, void* udata);
 
 // TODO - would be nice to put this in as_index.h:
 typedef struct as_index_tree_shared_s {
-	cf_arenax*		arena;
+	cf_arenax*		arena;	//内存分配器
 
-	as_index_value_destructor destructor;
-	void*			destructor_udata;
+	as_index_value_destructor destructor; //当索引条目被删除时调用的析构函数。
+	void*			destructor_udata;		//用户上下文数据
 
 	// Number of sprigs per partition tree.
-	uint32_t		n_sprigs;
+	uint32_t		n_sprigs;	//sprig 总数
 
 	// Bit-shifts used to calculate indexes from digest bits.
-	uint32_t		locks_shift;
-	uint32_t		sprigs_shift;
+	uint32_t		locks_shift;	//用于从 digest 计算锁索引的位移。
+	uint32_t		sprigs_shift;	//用于从 digest 计算 sprig 索引的位移
 
 	// Offsets into as_index_tree struct's variable-sized data.
-	uint32_t		sprigs_offset;
-	uint32_t		puddles_offset;
+	uint32_t		sprigs_offset;	// sprig 数据区的起始偏移。
+	uint32_t		puddles_offset;	// puddle 数据区的偏移。
 } as_index_tree_shared;
 
 

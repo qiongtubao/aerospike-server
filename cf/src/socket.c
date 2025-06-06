@@ -735,7 +735,7 @@ cf_socket_init_server(cf_serv_cfg *cfg, cf_sockets *socks)
 		goto cleanup0;
 	}
 
-	cf_socket_fix_bind(cfg);
+	cf_socket_fix_bind(cfg); //绑定地址
 
 	cf_debug(CF_SOCKET, "Initializing %u server socket(s)", cfg->n_cfgs);
 	uint32_t n;
@@ -756,7 +756,7 @@ cf_socket_init_server(cf_serv_cfg *cfg, cf_sockets *socks)
 		cf_sock_addr_to_native(&addr, (struct sockaddr *)&sas);
 
 		cf_debug(CF_SOCKET, "Initializing server for %s", cf_sock_addr_print(&addr));
-		int32_t fd = socket(sas.ss_family, SOCK_STREAM, 0);
+		int32_t fd = socket(sas.ss_family, SOCK_STREAM, 0); //创建tcp socket
 
 		if (fd < 0) {
 			cf_warning(CF_SOCKET, "Error while creating socket for %s: %d (%s)",
@@ -768,16 +768,16 @@ cf_socket_init_server(cf_serv_cfg *cfg, cf_sockets *socks)
 		sock->fd = fd;
 		fd = -1;
 
-		cf_socket_fix_server(sock);
-		cf_socket_disable_blocking(sock);
+		cf_socket_fix_server(sock); 	//服务器属性
+		cf_socket_disable_blocking(sock); //设置非阻塞模式
 
 		// No Nagle here. It will be disabled for the accepted connections.
 
 		static const int32_t flag = 1;
-		safe_setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+		safe_setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)); //允许重启服务时快速复用地址
 
 		while (bind(sock->fd, (struct sockaddr *)&sas,
-				cf_socket_addr_len((struct sockaddr *)&sas)) < 0) {
+				cf_socket_addr_len((struct sockaddr *)&sas)) < 0) { //绑定指定地址和端口 如果被占用就 等待5s 后重试
 			if (errno != EADDRINUSE) {
 				cf_warning(CF_SOCKET, "Error while binding to %s: %d (%s)",
 						cf_sock_addr_print(&addr), errno, cf_strerror(errno));
@@ -788,7 +788,7 @@ cf_socket_init_server(cf_serv_cfg *cfg, cf_sockets *socks)
 			usleep(5 * 1000 * 1000);
 		}
 
-		if (listen(sock->fd, 4096) < 0) {
+		if (listen(sock->fd, 4096) < 0) {  //开始监听等待队列的最大长度4096
 			cf_warning(CF_SOCKET, "Error while listening on %s: %d (%s)",
 					cf_sock_addr_print(&addr), errno, cf_strerror(errno));
 			goto cleanup2;
@@ -801,17 +801,17 @@ cf_socket_init_server(cf_serv_cfg *cfg, cf_sockets *socks)
 	res = 0;
 	goto cleanup0;
 
-cleanup2:
+cleanup2: //清理单个失败socket
 	cf_socket_close(sock);
 	cf_socket_term(sock);
 
-cleanup1:
+cleanup1:	//清理之前创建成功的所有socket
 	for (uint32_t i = 0; i < n; ++i) {
 		cf_socket_close(&socks->socks[i]);
 		cf_socket_term(&socks->socks[i]);
 	}
 
-cleanup0:
+cleanup0:	//返回结果
 	return res;
 }
 

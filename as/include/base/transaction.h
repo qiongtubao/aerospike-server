@@ -120,20 +120,20 @@
 //
 
 typedef struct as_file_handle_s {
-	uint8_t		poll_data_type;	// one of CF_POLL_DATA_* - must be first
+	uint8_t		poll_data_type;	// 当前类型 // one of CF_POLL_DATA_* - must be first
 
-	char		client[63];		// client identifier (currently ip-addr:port)
-	uint64_t	last_used;		// last nanoseconds we read or wrote
-	cf_socket	sock;			// our client socket
-	cf_poll		poll;			// our epoll instance
-	uint32_t	in_transaction;	// don't reap or transfer during transaction
-	bool		move_me;		// redistribute to another service thread
-	bool		reap_me;		// force reaping (overrides in_transaction)
-	bool		is_xdr;			// XDR client connection
-	as_proto	proto_hdr;		// space for header when reading it from socket
-	as_proto	*proto;			// complete request message
-	uint64_t	proto_unread;	// bytes not yet read from socket
-	void		*security_filter;
+	char		client[63];		//客户端地址字符串 // client identifier (currently ip-addr:port)
+	uint64_t	last_used;		//最后一次读/写时间 // last nanoseconds we read or wrote
+	cf_socket	sock;			//客户端socket // our client socket
+	cf_poll		poll;			//所属epoll实例 // our epoll instance
+	uint32_t	in_transaction;	// 是否正在进行事务 // don't reap or transfer during transaction
+	bool		move_me;		// 是否需要迁移到其他线程 // redistribute to another service thread
+	bool		reap_me;		// 是否标记为强制回收 // force reaping (overrides in_transaction)
+	bool		is_xdr;			// 是否是XDR连接 // XDR client connection
+	as_proto	proto_hdr;		// 协议头缓存（读取时使用）// space for header when reading it from socket
+	as_proto	*proto;			// 当前完整协议头指针 //complete request message
+	uint64_t	proto_unread;	// 还未从 socket读取的协议字节 // bytes not yet read from socket
+	void		*security_filter; //安全过滤器 （认证 权限控制）
 } as_file_handle;
 
 // Helpers to release transaction file handles.
@@ -183,25 +183,25 @@ struct iudf_origin_s;
 struct iops_origin_s;
 struct monitor_roll_origin_s;
 
-typedef struct as_transaction_s {
+typedef struct as_transaction_s { //事务对象
 
 	//------------------------------------------------------
 	// transaction 'head' - copied onto queue.
 	//
 
-	cl_msg*		msgp;
-	uint32_t	msg_fields;
+	cl_msg*		msgp; 			//消息对象的指针 包含客户端请求的所有信息
+	uint32_t	msg_fields;		//标记哪些字段
 
-	uint8_t		origin;
-	uint8_t		from_flags;
+	uint8_t		origin;			//事务来源
+	uint8_t		from_flags;		//标志位
 
 	// 2 spare bytes.
 
 	union {
-		void*						any;
-		as_file_handle*				proto_fd_h;
-		cf_node						proxy_node;
-		struct as_batch_shared_s*	batch_shared;
+		void*						any; 					//泛型指针
+		as_file_handle*				proto_fd_h;				//客户端连接句柄
+		cf_node						proxy_node;				//代理节点
+		struct as_batch_shared_s*	batch_shared;			
 		struct iudf_origin_s*		iudf_orig;
 		struct iops_origin_s*		iops_orig;
 		struct monitor_roll_origin_s* monitor_roll_orig;
@@ -211,15 +211,15 @@ typedef struct as_transaction_s {
 	} from;
 
 	union {
-		uint32_t any;
-		uint32_t proxy_tid;
-		uint32_t batch_index;
+		uint32_t any;			//通用
+		uint32_t proxy_tid;		//代理事务id
+		uint32_t batch_index;	//批量索引
 	} from_data;
 
-	cf_digest	keyd; // only batch sub-transactions require this on queue
+	cf_digest	keyd; //唯一标识符 // only batch sub-transactions require this on queue
 
-	uint64_t	start_time;
-	uint64_t	benchmark_time;
+	uint64_t	start_time;		//事务开始时间 纳秒
+	uint64_t	benchmark_time;	//性能测试时间
 
 	//<><><><><><><><><><><> 64 bytes <><><><><><><><><><><>
 
@@ -227,17 +227,17 @@ typedef struct as_transaction_s {
 	// transaction 'body' - NOT copied onto queue.
 	//
 
-	as_partition_reservation rsv;
+	as_partition_reservation rsv; 	//分区预留信息 确保对记录的一致性访问
 
-	uint64_t	end_time;
-	uint8_t		result_code;
-	uint8_t		flags;
-	uint16_t	generation;
-	uint32_t	void_time;
-	uint64_t	last_update_time;
+	uint64_t	end_time;			//事务截止时间 （ttl或者全局超时时间）
+	uint8_t		result_code;		// 事务执行结果的状态码
+	uint8_t		flags;				// 标志位  （事务特性或状态）
+	uint16_t	generation;			// 版本号 （冲突检测）
+	uint32_t	void_time;			// 过期时间戳
+	uint64_t	last_update_time;	//上次更新时间
 
 	// "Short scope" items - not mirrored on rw_request.
-	uint64_t	epoch_ms;
+	uint64_t	epoch_ms;			//纪元时间
 
 } as_transaction;
 

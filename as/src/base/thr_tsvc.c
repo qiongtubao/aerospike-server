@@ -120,7 +120,7 @@ detail_unique(const as_transaction *tr, bool is_write)
 void
 as_tsvc_process_transaction(as_transaction *tr)
 {
-	if (tr->msgp->proto.type == PROTO_TYPE_INTERNAL_XDR) {
+	if (tr->msgp->proto.type == PROTO_TYPE_INTERNAL_XDR) { //XDR 内部事务
 		as_xdr_read(tr);
 		return;
 	}
@@ -130,13 +130,13 @@ as_tsvc_process_transaction(as_transaction *tr)
 	cl_msg *msgp = tr->msgp;
 	as_msg *m = &msgp->msg;
 
-	as_transaction_init_body(tr);
+	as_transaction_init_body(tr); //初始化事务body
 
 	// Check that the socket is authenticated.
-	if (tr->origin == FROM_CLIENT) {
+	if (tr->origin == FROM_CLIENT) { // 客户端连接需要认证 
 		uint8_t result = as_security_check_auth(tr->from.proto_fd_h);
 
-		if (result != AS_OK) {
+		if (result != AS_OK) { //认证失败
 			as_security_log(tr->from.proto_fd_h, result, PERM_NONE, NULL, NULL);
 			as_transaction_error(tr, NULL, (uint32_t)result);
 			goto Cleanup;
@@ -144,7 +144,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 
 	// All transactions must have a namespace.
-	as_msg_field *nf = as_msg_field_get(m, AS_MSG_FIELD_TYPE_NAMESPACE);
+	as_msg_field *nf = as_msg_field_get(m, AS_MSG_FIELD_TYPE_NAMESPACE); //所有事务必须指定命名空间 （相当数据库）
 
 	if (! nf) {
 		cf_warning(AS_TSVC, "no namespace in protocol request");
@@ -152,7 +152,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 		goto Cleanup;
 	}
 
-	as_namespace *ns = as_namespace_get_bymsgfield(nf);
+	as_namespace *ns = as_namespace_get_bymsgfield(nf); //检查命名空间是否存在
 
 	if (! ns) {
 		uint32_t ns_sz = as_msg_field_get_value_sz(nf);
@@ -165,12 +165,12 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 
 	// Have we finished the very first partition balance?
-	if (! as_partition_balance_is_init_resolved()) {
-		if (tr->origin == FROM_PROXY) {
+	if (! as_partition_balance_is_init_resolved()) { //集群未完成初始化分区分配, 分区平衡状态检查
+		if (tr->origin == FROM_PROXY) { //代理 请求回退
 			as_proxy_return_to_sender(tr, ns);
 			tr->from.proxy_node = 0; // pattern, not needed
 		}
-		else {
+		else {	//拒绝事务
 			cf_debug(AS_TSVC, "rejecting transaction - initial partition balance unresolved");
 			as_transaction_error(tr, NULL, AS_ERR_UNAVAILABLE);
 			// Note that we forfeited namespace info above so query doesn't get
@@ -184,13 +184,13 @@ as_tsvc_process_transaction(as_transaction *tr)
 	// Query.
 	//
 
-	if (as_transaction_is_query(tr)) {
+	if (as_transaction_is_query(tr)) { //查询事务处理
 		if (! as_security_check_data_op(tr, ns, query_perm(tr))) {
 			as_multi_rec_transaction_error(tr, tr->result_code);
 			goto Cleanup;
 		}
 
-		rv = as_query(tr, ns);
+		rv = as_query(tr, ns); //调用查询 （扫描 二级索引查询等）
 
 		if (rv != 0) {
 			as_multi_rec_transaction_error(tr, rv);
@@ -205,27 +205,27 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	// Calculate end_time based on message transaction TTL. May be recalculating
 	// for re-queued transactions, but nice if end_time not copied on/off queue.
-	if (m->transaction_ttl != 0) {
+	if (m->transaction_ttl != 0) { //设置指定超时时间
 		tr->end_time = tr->start_time +
 				((uint64_t)m->transaction_ttl * 1000000);
 	}
 	else {
 		// Incorporate g_config.transaction_max_ns if appropriate.
 		// TODO - should g_config.transaction_max_ns = 0 be special?
-		tr->end_time = tr->start_time + g_config.transaction_max_ns;
+		tr->end_time = tr->start_time + g_config.transaction_max_ns; //全局最大超时时间
 	}
 
 	// Did the transaction time out while on the queue?
-	if (cf_getns() > tr->end_time) {
+	if (cf_getns() > tr->end_time) { //检查是否已超时
 		cf_debug(AS_TSVC, "transaction timed out in queue");
 		as_transaction_error(tr, ns, AS_ERR_TIMEOUT);
 		goto Cleanup;
 	}
 
 	// Copy digest if not already in tr.
-	if (as_transaction_has_digest(tr)) {
+	if (as_transaction_has_digest(tr)) { //是否有唯一标识
 		as_msg_field *df = as_msg_field_get(m, AS_MSG_FIELD_TYPE_DIGEST_RIPE);
-		uint32_t digest_sz = as_msg_field_get_value_sz(df);
+		uint32_t digest_sz = as_msg_field_get_value_sz(df); //value大小
 
 		if (digest_sz != sizeof(cf_digest)) {
 			cf_warning(AS_TSVC, "digest msg field size %u", digest_sz);
@@ -233,7 +233,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 			goto Cleanup;
 		}
 
-		tr->keyd = *(cf_digest *)df->data;
+		tr->keyd = *(cf_digest *)df->data; //提取key digest
 	}
 	// else - batch sub-transactions & all internal transactions have no digest
 	// in the message - digest is already in tr.
@@ -249,7 +249,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	uint32_t pid = as_partition_getid(&tr->keyd);
 	cf_node dest;
 
-	if (is_write) {
+	if (is_write) { //写操作
 		if (should_security_check_data_op(tr) &&
 				! as_security_check_data_op(tr, ns,
 						PERM_WRITE | (is_read ? PERM_READ : 0))) {
@@ -257,16 +257,16 @@ as_tsvc_process_transaction(as_transaction *tr)
 			goto Cleanup;
 		}
 
-		rv = as_partition_reserve_write(ns, pid, &tr->rsv, &dest);
+		rv = as_partition_reserve_write(ns, pid, &tr->rsv, &dest); // 获得写锁  防止并发写冲突
 	}
-	else if (is_read) {
+	else if (is_read) { //读操作
 		if (should_security_check_data_op(tr) &&
 				! as_security_check_data_op(tr, ns, PERM_READ)) {
 			as_transaction_error(tr, ns, tr->result_code);
 			goto Cleanup;
 		}
 
-		rv = as_partition_reserve_read_tr(ns, pid, tr, &dest);
+		rv = as_partition_reserve_read_tr(ns, pid, tr, &dest); //获得读锁
 	}
 	else {
 		cf_warning(AS_TSVC, "transaction is neither read nor write - unexpected");
@@ -291,46 +291,46 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 		transaction_status status;
 
-		if (is_write) {
-			if (as_transaction_is_delete(tr)) {
+		if (is_write) { //写事务
+			if (as_transaction_is_delete(tr)) { //删除
 				status = convert_to_write(tr, &msgp) ?
 						as_write_start(tr) : as_delete_start(tr);
 			}
-			else if (tr->origin == FROM_IUDF || as_transaction_is_udf(tr)) {
+			else if (tr->origin == FROM_IUDF || as_transaction_is_udf(tr)) { //udf调用
 				status = as_udf_start(tr);
 			}
-			else if (tr->origin == FROM_READ_TOUCH) {
+			else if (tr->origin == FROM_READ_TOUCH) { //读touch
 				status = as_read_touch_start(tr);
 			}
-			else if (tr->origin == FROM_RE_REPL) {
+			else if (tr->origin == FROM_RE_REPL) { //复制
 				status = as_re_replicate_start(tr);
 			}
-			else if (as_transaction_is_mrt_roll(tr)) {
+			else if (as_transaction_is_mrt_roll(tr)) { //mrt 回滚
 				status = as_mrt_roll_start(tr);
 			}
 			else {
-				status = as_write_start(tr);
+				status = as_write_start(tr); //写操作
 			}
 		}
 		else {
-			if (as_transaction_is_mrt_verify_read(tr)) {
+			if (as_transaction_is_mrt_verify_read(tr)) { //mrt 核实 读
 				status = as_mrt_verify_read_start(tr);
 			}
 			else {
-				status = as_read_start(tr);
+				status = as_read_start(tr); //读操作
 			}
 		}
 
-		switch (status) {
-		case TRANS_DONE:
+		switch (status) { //处理事务状态
+		case TRANS_DONE: //已完成 释放分区锁
 			// Done, response already sent - free msg & release reservation.
 			as_partition_release(&tr->rsv);
 			break;
-		case TRANS_IN_PROGRESS:
+		case TRANS_IN_PROGRESS: //异步处理中 不释放锁和msgp
 			// Don't free msg or release reservation - both owned by rw_request.
 			free_msgp = false;
 			break;
-		case TRANS_WAITING:
+		case TRANS_WAITING: //等待重试，释放锁但保留msgp
 			// Will be re-queued - don't free msg, but release reservation.
 			free_msgp = false;
 			as_partition_release(&tr->rsv);
@@ -343,12 +343,12 @@ as_tsvc_process_transaction(as_transaction *tr)
 	else {
 		// <><><><><><>  Reservation Failed  <><><><><><>
 
-		switch (tr->origin) {
+		switch (tr->origin) { //
 		case FROM_CLIENT:
 		case FROM_BATCH:
 		case FROM_MONITOR_ROLL:
 		case FROM_MONITOR_DELETE:
-			as_proxy_divert(dest, tr, ns);
+			as_proxy_divert(dest, tr, ns); //代理转发到其他目标节点
 			// CLIENT: fabric owns msgp, BATCH: it's shared, don't free it.
 			free_msgp = false;
 			break;
@@ -388,7 +388,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 Cleanup:
 
-	if (free_msgp && ! SHARED_MSGP(tr)) {
+	if (free_msgp && ! SHARED_MSGP(tr)) { //清理msgp资源
 		cf_free(msgp);
 	}
 } // end process_transaction()

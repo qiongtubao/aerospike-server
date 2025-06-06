@@ -100,42 +100,42 @@ as_query_manager_init(void)
 }
 
 int
-as_query_manager_start_job(as_query_job* _job)
+as_query_manager_start_job(as_query_job* _job) //加入查询管理系统 决定是内联执行还是启动一个线程来处理任务
 {
 	if (_job->si != NULL) {
-		_job->start_ms_clepoch = cf_clepoch_milliseconds();
+		_job->start_ms_clepoch = cf_clepoch_milliseconds(); //开始时间
 	}
 
 	if (_job->do_inline) {
-		as_query_job_run((void*)_job);
+		as_query_job_run((void*)_job); //当前线程直接执行
 		return 0;
 	}
 
 	cf_mutex_lock(&g_mgr.lock);
 
-	if (g_n_query_threads >= g_config.n_query_threads_limit) {
+	if (g_n_query_threads >= g_config.n_query_threads_limit) { //查询线程太多 返回失败
 		cf_warning(AS_QUERY, "at query threads limit - can't start new query");
 		cf_mutex_unlock(&g_mgr.lock);
 		return AS_ERR_FORBIDDEN;
 	}
 
-	if (! _job->is_short) {
-		_job->base_us = _job->start_ns / 1000; // for throttling
+	if (! _job->is_short) { //长查询
+		_job->base_us = _job->start_ns / 1000; // for throttling 
 
 		// Make sure trid is unique.
-		if (find_any(_job->trid)) {
+		if (find_any(_job->trid)) { //去重 查询活跃队列
 			cf_warning(AS_QUERY, "job with trid %lu already active",
 					_job->trid);
 			cf_mutex_unlock(&g_mgr.lock);
 			return AS_ERR_PARAMETER;
 		}
 
-		cf_queue_push(g_mgr.active_jobs, &_job);
+		cf_queue_push(g_mgr.active_jobs, &_job); //将任务加入到活跃队列 注册
 	}
 
-	add_query_job_thread(_job);
+	add_query_job_thread(_job); //启动一个新线程来执行查询任务
 
-	cf_mutex_unlock(&g_mgr.lock);
+	cf_mutex_unlock(&g_mgr.lock); //解锁
 
 	return 0;
 }

@@ -142,92 +142,92 @@ as_query_job_run(void* pv_job)
 {
 	as_query_job* _job = (as_query_job*)pv_job;
 
-	if (! _job->is_short && ! _job->started) {
-		_job->base_sys_tid = cf_thread_sys_tid();
-		_job->started = true;
+	if (! _job->is_short && ! _job->started) { //长查询 并未开始
+		_job->base_sys_tid = cf_thread_sys_tid(); //设置线程id
+		_job->started = true;					  //开始
 
 		if (_job->rps == 0) {
-			as_query_manager_add_max_job_threads(_job);
+			as_query_manager_add_max_job_threads(_job); 
 		}
 	}
 
-	if (_job->is_short) {
+	if (_job->is_short) { //短查询资源预留
 		reserve_rsvs(_job);
 	}
 
 	cf_buf_builder* bb = NULL;
 	uint32_t pid;
 
-	while ((pid = as_faa_uint32(&_job->pid, 1)) < AS_PARTITIONS) {
+	while ((pid = as_faa_uint32(&_job->pid, 1)) < AS_PARTITIONS) { //分区循环处理
 		as_partition_reservation rsv;
 
-		if (_job->pids == NULL) {
-			if (as_partition_reserve_write(_job->ns, pid, &rsv, NULL) != 0) {
+		if (_job->pids == NULL) { //未指定pids 全表扫描
+			if (as_partition_reserve_write(_job->ns, pid, &rsv, NULL) != 0) { //获得写锁
 				continue;
 			}
 		}
 		else {
-			if (! _job->pids[pid].requested) {
+			if (! _job->pids[pid].requested) { //未被请求的分区 跳过
 				continue;
 			}
 
-			if (_job->is_short) {
-				_job->vtable.slice_fn(_job, &_job->query_rsvs[pid], &bb);
+			if (_job->is_short) { //短查询
+				_job->vtable.slice_fn(_job, &_job->query_rsvs[pid], &bb); //使用已预留的锁直接处理
 				continue;
 			}
 
 			if (as_partition_reserve_query(_job->ns, pid, &rsv,
-					_job->relax) != 0) {
+					_job->relax) != 0) { //动态获得锁并处理
 				// Null tree causes slice_fn to send partition-done error.
 				rsv = (as_partition_reservation){
 						.ns = _job->ns,
 						.p = &_job->ns->partitions[pid]
 				};
 
-				_job->vtable.slice_fn(_job, &rsv, &bb);
+				_job->vtable.slice_fn(_job, &rsv, &bb); 
 				continue;
 			}
 		}
 
-		_job->vtable.slice_fn(_job, &rsv, &bb);
+		_job->vtable.slice_fn(_job, &rsv, &bb); //虚函数  根据类型绑定到不同实现   basic_query_job_slice
 		as_partition_release(&rsv);
 
 		if (! _job->is_short && cf_thread_sys_tid() != _job->base_sys_tid &&
 				(_job->n_threads > _job->ns->n_single_query_threads ||
-						g_n_query_threads > g_config.n_query_threads_limit)) {
+						g_n_query_threads > g_config.n_query_threads_limit)) { //检查是否超限
 			break;
 		}
 	}
 
 	if (bb != NULL) {
-		_job->vtable.slice_fn(_job, NULL, &bb);
+		_job->vtable.slice_fn(_job, NULL, &bb); //处理builder结果
 		cf_buf_builder_free(bb);
 	}
 
 	if (_job->is_short) {
-		release_rsvs(_job->query_rsvs);
+		release_rsvs(_job->query_rsvs); //释放分区锁
 	}
 
 	int32_t n = 0;
 
-	if (! _job->do_inline) {
-		as_decr_uint32(&g_n_query_threads);
+	if (! _job->do_inline) { //非当前线程直接执行
+		as_decr_uint32(&g_n_query_threads); //减少线程计数
 		n = (int32_t)as_aaf_uint32_rls(&_job->n_threads, -1);
 
 		cf_assert(n >= 0, AS_QUERY, "query job thread underflow %d", n);
 	}
 
-	if (n == 0) {
+	if (n == 0) { //最后一个线程
 		// Subsequent finish/destroy may require an 'acquire' barrier.
 		as_fence_acq();
 
-		finish(_job);
+		finish(_job); //完成任务
 
 		if (_job->is_short) {
-			as_query_job_destroy(_job);
+			as_query_job_destroy(_job); //释放任务
 		}
 		else {
-			as_query_manager_finish_job(_job);
+			as_query_manager_finish_job(_job); //通知任务管理器 完成任务
 		}
 	}
 

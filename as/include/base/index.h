@@ -45,58 +45,58 @@
 typedef struct as_index_s {
 
 	// offset: 0
-	uint16_t rc; // for now, incremented & decremented only when reducing sprig
+	uint16_t rc; //引用次数 16+8位 原子性的 // for now, incremented & decremented only when reducing sprig
 
 	// offset: 2
 	uint8_t : 8; // reserved for bigger rc, if needed
 
 	// offset: 3
-	uint8_t tree_id: 6;
-	uint8_t color: 1;
-	uint8_t is_orig: 1;
+	uint8_t tree_id: 6; //record 所属的二级索引树id 最多63
+	uint8_t color: 1;	// 红/黑  
+	uint8_t is_orig: 1; //是否为原始节点
 
 	// offset: 4
-	cf_digest keyd;
+	cf_digest keyd;		//digest 唯一标识 构建索引树  快速查找
 
 	// offset: 24
-	uint64_t left_h: 40;
-	uint64_t right_h: 40;
+	uint64_t left_h: 40;	//左节点
+	uint64_t right_h: 40;	//右节点
 
 	// offset: 34
-	uint16_t set_id_bits: 12;
-	uint16_t in_sindex: 1;
-	uint16_t xdr_bin_cemetery: 1;
-	uint16_t has_bin_meta: 1; // named for warm restart erase (was for old DIM)
-	uint16_t xdr_write: 1;
+	uint16_t set_id_bits: 12; 		//所属set集群id 最多4095个集群
+	uint16_t in_sindex: 1;			//是否在二级索引中
+	uint16_t xdr_bin_cemetery: 1;	//是否已加入XDR bin 回收站
+	uint16_t has_bin_meta: 1; 		//是否包含bin元数据（用于热重启）// named for warm restart erase (was for old DIM)
+	uint16_t xdr_write: 1;			//是否参与XDR写入
 
 	// offset: 36
-	uint32_t xdr_tombstone: 1;
-	uint32_t xdr_nsup_tombstone: 1;
-	uint32_t void_time: 30;
+	uint32_t xdr_tombstone: 1;		//XDR 删除标记
+	uint32_t xdr_nsup_tombstone: 1;	//NSUP 过期清理 删除标记
+	uint32_t void_time: 30;			//记录过期时间戳
 
 	// offset: 40
-	uint64_t last_update_time: 40;
-	uint64_t generation: 16;
+	uint64_t last_update_time: 40;	//最后一次更新的时间戳
+	uint64_t generation: 16;		//记录版本号 每次修改递增
 
 	// offset: 47
 	// Used by the storage engines.
-	uint64_t rblock_id: 37;		// can address 2^37 * 16b = 2Tb drive
-	uint64_t n_rblocks: 19;		// is enough for 8Mb/16b = 512K rblocks
-	uint64_t file_id: 7;		// can spec 2^7 = 128 drives
-	uint64_t key_stored: 1;
+	uint64_t rblock_id: 37;		//可寻址2TB // can address 2^37 * 16b = 2Tb drive
+	uint64_t n_rblocks: 19;		//占用数据块数量最多512K // is enough for 8Mb/16b = 512K rblocks
+	uint64_t file_id: 7;		//最多128个设备 // can spec 2^7 = 128 drives
+	uint64_t key_stored: 1;		//主键是否存储在磁盘
 
 	// offset: 55
-	uint8_t repl_state: 2;
-	uint8_t tombstone: 1;
-	uint8_t cenotaph: 1;
+	uint8_t repl_state: 2;		//复制状态 active pending dead
+	uint8_t tombstone: 1;		//表示该记录已被删除
+	uint8_t cenotaph: 1;		//表示该记录仅存在于索引中， 无实际数据
 	uint8_t : 4;
 
 	// offset: 56
 	// MRT-related members.
 	union {
 		struct {
-			uint64_t orig_h: 40;
-			uint64_t : 24;
+			uint64_t orig_h: 40;		//指向原始记录的handle （乐观锁冲突处理）
+			uint64_t : 24;				//Mutating Record Tree 唯一id 用于并发事务管理
 		} __attribute__ ((__packed__));
 
 		uint64_t mrt_id;
@@ -114,7 +114,7 @@ COMPILER_ASSERT(sizeof(as_index) == 64);
 //
 
 static inline uint16_t
-as_index_reserve(as_index* index)
+as_index_reserve(as_index* index) //引用计数+1
 {
 	uint16_t rc = as_aaf_uint16(&(index->rc), 1);
 
@@ -125,7 +125,7 @@ as_index_reserve(as_index* index)
 
 // No '_rls' needed on atomic decrement here since this is always under olock.
 static inline uint16_t
-as_index_release(as_index* index)
+as_index_release(as_index* index) //引用计数-1
 {
 	uint16_t rc = as_aaf_uint16(&(index->rc), -1);
 
@@ -257,20 +257,20 @@ struct as_set_index_tree_s;
 
 typedef void (*as_index_tree_done_fn) (uint8_t id, void* udata);
 
-typedef struct as_index_tree_s {
-	uint8_t id;
-	as_index_tree_done_fn done_cb;
-	void* udata;
+typedef struct as_index_tree_s {	//索引树
+	uint8_t id;						//树id
+	as_index_tree_done_fn done_cb;	//析构函数
+	void* udata;					//用户上下文
 
 	// Data common to all trees in a namespace.
-	as_index_tree_shared* shared;
+	as_index_tree_shared* shared;	//指向共享内存区域 （多个树共享该部分配置和资源）
 
-	uint64_t n_elements;
+	uint64_t n_elements;			//当前树中元素数量
 
-	cf_mutex set_trees_lock;
-	struct as_set_index_tree_s* set_trees[1 + AS_SET_MAX_COUNT]; // 32M/cluster
+	cf_mutex set_trees_lock;		//锁保护
+	struct as_set_index_tree_s* set_trees[1 + AS_SET_MAX_COUNT]; //集合set对应的索引树数组 // 32M/cluster 
 
-	// Variable length data, dependent on configuration.
+	//可变长度数据区（存储 sprigs puddles locks） // Variable length data, dependent on configuration.
 	uint8_t data[];
 } as_index_tree;
 
@@ -420,14 +420,14 @@ void as_index_grow_ph_array(as_index_ph_array* ph_a);
 
 // Container for sprig-level function parameters.
 typedef struct as_index_sprig_s {
-	as_index_value_destructor destructor;
-	void* destructor_udata;
+	as_index_value_destructor destructor;	//析构函数
+	void* destructor_udata;					//析构函数用的上下文数据
 
-	cf_arenax* arena;
+	cf_arenax* arena;						//内存分配器
 
-	as_lock_pair* pair;
-	as_sprig* sprig;
-	cf_arenax_puddle* puddle;
+	as_lock_pair* pair;						// lock + reduce_lock
+	as_sprig* sprig;						//sprig 对象地址
+	cf_arenax_puddle* puddle;				//可选内存池
 } as_index_sprig;
 
 bool as_index_sprig_reduce_no_rc(as_index_sprig* isprig, const cf_digest* keyd, as_index_reduce_fn cb, void* udata);

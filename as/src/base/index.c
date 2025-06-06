@@ -93,14 +93,14 @@ as_index_sprig_from_i(as_index_tree* tree, as_index_sprig* isprig,
 		uint32_t sprig_i)
 {
 	uint32_t lock_i = sprig_i >>
-			(tree->shared->locks_shift - tree->shared->sprigs_shift);
+			(tree->shared->locks_shift - tree->shared->sprigs_shift); //计算锁索引
 
-	isprig->destructor = tree->shared->destructor;
-	isprig->destructor_udata = tree->shared->destructor_udata;
-	isprig->arena = tree->shared->arena;
-	isprig->pair = tree_locks(tree) + lock_i;
-	isprig->sprig = tree_sprigs(tree) + sprig_i;
-	isprig->puddle = tree_puddle_for_sprig(tree, sprig_i);
+	isprig->destructor = tree->shared->destructor; 				//sprig 被释放时调用的清理函数
+	isprig->destructor_udata = tree->shared->destructor_udata; 	//析构函数的上下文数据
+	isprig->arena = tree->shared->arena; 						//内存分配器
+	isprig->pair = tree_locks(tree) + lock_i;					//lock + reduce_lock
+	isprig->sprig = tree_sprigs(tree) + sprig_i;				//sprig 对象地址
+	isprig->puddle = tree_puddle_for_sprig(tree, sprig_i);		//内存池
 }
 
 
@@ -252,20 +252,20 @@ as_index_reduce_from(as_index_tree* tree, const cf_digest* keyd,
 	// Reduce sprigs from largest to smallest digests to preserve this order for
 	// the whole tree. (Rapid rebalance requires exact order.)
 
-	uint32_t start_sprig_i = keyd == NULL ?
+	uint32_t start_sprig_i = keyd == NULL ? //没有keyd 从最大digest 开始
 			tree->shared->n_sprigs - 1 : as_index_sprig_i_from_keyd(tree, keyd);
 
-	for (int i = (int)start_sprig_i; i >= 0; i--) {
-		as_index_sprig isprig;
-		as_index_sprig_from_i(tree, &isprig, (uint32_t)i);
+	for (int i = (int)start_sprig_i; i >= 0; i--) { //倒序遍历
+		as_index_sprig isprig; //as_index_sprig 是 sprig 的只读视图
+		as_index_sprig_from_i(tree, &isprig, (uint32_t)i); //树中读取数据
 
 		if (tree->shared->puddles_offset == 0) {
-			if (! as_index_sprig_reduce(&isprig, keyd, cb, udata)) {
+			if (! as_index_sprig_reduce(&isprig, keyd, cb, udata)) { //内存池分配资源
 				return false;
 			}
 		}
 		else {
-			if (! as_index_sprig_reduce_no_rc(&isprig, keyd, cb, udata)) {
+			if (! as_index_sprig_reduce_no_rc(&isprig, keyd, cb, udata)) { //不是使用引用计数
 				return false;
 			}
 		}
@@ -405,12 +405,12 @@ as_index_sprig_reduce(as_index_sprig* isprig, const cf_digest* keyd,
 	cf_mutex_lock(&isprig->pair->reduce_lock);
 
 	// Common to encounter empty sprigs.
-	if (isprig->sprig->root_h == SENTINEL_H) {
+	if (isprig->sprig->root_h == SENTINEL_H) { //空
 		cf_mutex_unlock(&isprig->pair->reduce_lock);
 		return true;
 	}
 
-	as_index_ph stack_phs[MAX_STACK_PHS];
+	as_index_ph stack_phs[MAX_STACK_PHS]; //初始化记录指针数组
 	as_index_ph_array ph_a = {
 			.is_stack = true,
 			.capacity = MAX_STACK_PHS,
@@ -418,13 +418,13 @@ as_index_sprig_reduce(as_index_sprig* isprig, const cf_digest* keyd,
 	};
 
 	// Traverse just fills array, then we make callbacks outside reduce lock.
-	as_index_sprig_traverse(isprig, keyd, isprig->sprig->root_h, &ph_a);
+	as_index_sprig_traverse(isprig, keyd, isprig->sprig->root_h, &ph_a); //从根节点 遍历sprig
 
 	cf_mutex_unlock(&isprig->pair->reduce_lock);
 
 	bool do_more = true;
 
-	for (uint32_t i = 0; i < ph_a.n_used; i++) {
+	for (uint32_t i = 0; i < ph_a.n_used; i++) { //遍历
 		as_index_ph* ph = &ph_a.phs[i];
 		as_index_ref r_ref = {
 				.r = ph->r,
@@ -434,13 +434,13 @@ as_index_sprig_reduce(as_index_sprig* isprig, const cf_digest* keyd,
 
 		cf_mutex_lock(r_ref.olock);
 
-		uint16_t rc = as_index_release(r_ref.r);
+		uint16_t rc = as_index_release(r_ref.r); //减少计数
 
 		// Ignore this record if it's been deleted.
-		if (! as_index_is_valid_record(r_ref.r)) {
+		if (! as_index_is_valid_record(r_ref.r)) { //无效
 			as_namespace* ns = isprig->destructor_udata;
 
-			if (rc == 0) {
+			if (rc == 0) { //清理
 				if (isprig->destructor != NULL) {
 					isprig->destructor(r_ref.r, ns);
 				}
@@ -449,17 +449,17 @@ as_index_sprig_reduce(as_index_sprig* isprig, const cf_digest* keyd,
 				cf_assert(r_ref.r->orig_h == 0, AS_INDEX,
 						"unexpected - dropped provisional");
 
-				cf_arenax_free(isprig->arena, r_ref.r_h, NULL);
+				cf_arenax_free(isprig->arena, r_ref.r_h, NULL); //内存释放
 			}
 			else if (r_ref.r->in_sindex == 1 && rc == 1) {
-				as_sindex_gc_record(ns, &r_ref);
+				as_sindex_gc_record(ns, &r_ref); //gc
 			}
 
 			cf_mutex_unlock(r_ref.olock);
 			continue;
 		}
 
-		if (do_more) {
+		if (do_more) { //回调
 			// Callback MUST call as_record_done() to unlock record.
 			do_more = cb(&r_ref, udata);
 		}
@@ -468,7 +468,7 @@ as_index_sprig_reduce(as_index_sprig* isprig, const cf_digest* keyd,
 		}
 	}
 
-	if (! ph_a.is_stack) {
+	if (! ph_a.is_stack) { //堆
 		cf_free(ph_a.phs);
 	}
 
@@ -479,35 +479,35 @@ static void
 as_index_sprig_traverse(as_index_sprig* isprig, const cf_digest* keyd,
 		cf_arenax_handle r_h, as_index_ph_array* ph_a)
 {
-	if (r_h == SENTINEL_H) {
+	if (r_h == SENTINEL_H) { //空节点
 		return;
 	}
 
-	as_index* r = RESOLVE(r_h);
+	as_index* r = RESOLVE(r_h); //获得当前节点
 	int cmp = 0; // initialized to satisfy compiler
 
-	if (keyd == NULL || (cmp = cf_digest_compare(&r->keyd, keyd)) < 0) {
-		as_index_sprig_traverse(isprig, keyd, r->left_h, ph_a);
+	if (keyd == NULL || (cmp = cf_digest_compare(&r->keyd, keyd)) < 0) { //如果没有指定 keyd 或当前节点 digest < keyd → 需要继续往左子树找更小 digest 的记录
+		as_index_sprig_traverse(isprig, keyd, r->left_h, ph_a); //不会成为环的原因是二叉树？
 	}
 
-	if (ph_a->n_used == ph_a->capacity) {
+	if (ph_a->n_used == ph_a->capacity) { //动态扩容 当前数组满了进行扩容
 		as_index_grow_ph_array(ph_a);
 	}
 
 	// We do not collect the element with the boundary digest.
 
-	if (keyd == NULL || cmp < 0) {
-		as_index_reserve(r);
+	if (keyd == NULL || cmp < 0) { //已经到达边界点  全部收集，当前digest > 边界digest 可收集
+		as_index_reserve(r); //减少计数
 
 		as_index_ph* ph = &ph_a->phs[ph_a->n_used++];
 
-		ph->r = r;
-		ph->r_h = r_h;
+		ph->r = r; //保存指针
+		ph->r_h = r_h;//保存handle
 
 		keyd = NULL;
 	}
 
-	as_index_sprig_traverse(isprig, keyd, r->right_h, ph_a);
+	as_index_sprig_traverse(isprig, keyd, r->right_h, ph_a); //右子树遍历
 }
 
 // Used also by set indexes, not a local helper.
@@ -517,14 +517,14 @@ as_index_grow_ph_array(as_index_ph_array* ph_a)
 	uint32_t new_capacity = ph_a->capacity * 2;
 	size_t new_sz = sizeof(as_index_ph) * new_capacity;
 
-	if (ph_a->is_stack) {
+	if (ph_a->is_stack) {	//栈转成堆
 		as_index_ph* phs = cf_malloc(new_sz);
 
 		memcpy(phs, ph_a->phs, sizeof(as_index_ph) * ph_a->capacity);
 		ph_a->phs = phs;
 		ph_a->is_stack = false;
 	}
-	else {
+	else { 	//堆扩容
 		ph_a->phs = cf_realloc(ph_a->phs, new_sz);
 	}
 

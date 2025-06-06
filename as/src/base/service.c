@@ -178,16 +178,16 @@ as_service_init(void)
 void
 as_service_start(void)
 {
-	start_reaper();
+	start_reaper(); //后台定时清理空闲或失效的客户端链接
 
 	// Create listening sockets.
 
-	if (! g_config.service_localhost_disabled) {
+	if (! g_config.service_localhost_disabled) { //添加本地回环地址 127.0.0.1 普通和tls
 		add_localhost(&g_service_bind, CF_SOCK_OWNER_SERVICE);
 		add_localhost(&g_service_bind, CF_SOCK_OWNER_SERVICE_TLS);
 	}
 
-	if (cf_socket_init_server(&g_service_bind, &g_sockets) < 0) {
+	if (cf_socket_init_server(&g_service_bind, &g_sockets) < 0) { //创建并绑定TCP socket
 		cf_crash(AS_SERVICE, "couldn't initialize service socket");
 	}
 
@@ -347,11 +347,11 @@ create_service_thread(uint32_t sid)
 		ctx->i_cpu = (cf_topo_cpu_index)(sid % cf_topo_count_cpus());
 	}
 
-	ctx->lock = &g_thread_locks[sid];
-	cf_poll_create(&ctx->poll);
+	ctx->lock = &g_thread_locks[sid]; //线程锁
+	cf_poll_create(&ctx->poll);  //epoll 创建
 	cf_epoll_queue_init(&ctx->trans_q, AS_TRANSACTION_HEAD_SIZE, 64);
 
-	cf_thread_create_transient(run_service, ctx);
+	cf_thread_create_transient(run_service, ctx); //线程执行函数
 
 	cf_mutex_lock(&g_thread_locks[sid]);
 
@@ -402,18 +402,18 @@ add_localhost(cf_serv_cfg* serv_cfg, cf_sock_owner owner)
 //
 
 static void*
-run_accept(void* udata)
+run_accept(void* udata)	//监听所有服务端socket上的客户端链接请求 并对新链接进行初始化
 {
 	(void)udata;
 
 	cf_poll poll;
-	cf_poll_create(&poll);
+	cf_poll_create(&poll); //创建epoll
 
-	cf_poll_add_sockets(poll, &g_sockets, EPOLLIN);
+	cf_poll_add_sockets(poll, &g_sockets, EPOLLIN); //添加监听socket 加入epoll 监听EPOLLIN事件
 
 	while (true) {
 		cf_poll_event events[N_EVENTS];
-		int32_t n_events = cf_poll_wait(poll, events, N_EVENTS, -1);
+		int32_t n_events = cf_poll_wait(poll, events, N_EVENTS, -1); //等待epoll事件
 
 		cf_assert(n_events >= 0, AS_SERVICE, "unexpected EINTR");
 
@@ -422,7 +422,7 @@ run_accept(void* udata)
 			cf_socket csock;
 			cf_sock_addr caddr;
 
-			if (cf_socket_accept(ssock, &csock, &caddr) < 0) {
+			if (cf_socket_accept(ssock, &csock, &caddr) < 0) { //新连接
 				if (errno == EMFILE || errno == ENFILE) {
 					cf_ticker_warning(AS_SERVICE, "out of file descriptors");
 					continue;
@@ -441,7 +441,7 @@ run_accept(void* udata)
 			uint64_t n_opened =
 					as_load_uint64(&g_stats.proto_connections_opened);
 
-			if (n_opened - n_closed >= g_config.n_proto_fd_max) {
+			if (n_opened - n_closed >= g_config.n_proto_fd_max) { //检查连接数是否超过上限
 				cf_ticker_warning(AS_SERVICE,
 						"refusing client connection - proto-fd-max %u",
 						g_config.n_proto_fd_max);
@@ -451,20 +451,20 @@ run_accept(void* udata)
 				continue;
 			}
 
-			cf_socket_keep_alive(&csock, 60, 60, 2);
+			cf_socket_keep_alive(&csock, 60, 60, 2); //设置keep alive
 
-			if (cfg->owner == CF_SOCK_OWNER_SERVICE_TLS) {
+			if (cfg->owner == CF_SOCK_OWNER_SERVICE_TLS) { //是否是TLS连接  准备tls上下文
 				tls_socket_prepare_server(&csock, g_service_tls);
 			}
 
-			as_file_handle* fd_h = cf_rc_alloc(sizeof(as_file_handle));
+			as_file_handle* fd_h = cf_rc_alloc(sizeof(as_file_handle)); //填充file handle结构体
 			// Ref for epoll instance.
 
-			fd_h->poll_data_type = CF_POLL_DATA_CLIENT_IO;
+			fd_h->poll_data_type = CF_POLL_DATA_CLIENT_IO;	
 
-			cf_sock_addr_to_string_safe(&caddr, fd_h->client,
-					sizeof(fd_h->client));
-			cf_socket_copy(&csock, &fd_h->sock);
+			cf_sock_addr_to_string_safe(&caddr, fd_h->client, 
+					sizeof(fd_h->client)); //设置socket 地址
+			cf_socket_copy(&csock, &fd_h->sock); //复制socket信息
 
 			fd_h->last_used = cf_getns();
 			fd_h->in_transaction = 0;
@@ -475,24 +475,24 @@ run_accept(void* udata)
 			fd_h->proto_unread = sizeof(as_proto);
 			fd_h->security_filter = as_security_filter_create();
 
-			cf_rc_reserve(fd_h); // ref for reaper
+			cf_rc_reserve(fd_h); //增加计数 // ref for reaper
 
 			cf_mutex_lock(&g_reaper_lock);
 
 			uint32_t slot;
 
 			if (cf_queue_pop(&g_free_slots, &slot, CF_QUEUE_NOWAIT) !=
-					CF_QUEUE_OK) {
+					CF_QUEUE_OK) { //获得空闲槽位
 				cf_crash(AS_SERVICE, "cannot get free slot");
 			}
 
-			g_file_handles[slot] = fd_h;
+			g_file_handles[slot] = fd_h; //全局数组中
 
 			cf_mutex_unlock(&g_reaper_lock);
 
-			assign_socket(fd_h); // arms (EPOLLIN)
+			assign_socket(fd_h); //注册到epoll // arms (EPOLLIN)
 
-			as_incr_uint64(&g_stats.proto_connections_opened);
+			as_incr_uint64(&g_stats.proto_connections_opened); //增加统计计数  当前打开的连接数
 		}
 	}
 
@@ -510,25 +510,25 @@ assign_socket(as_file_handle* fd_h)
 	while (true) {
 		uint32_t sid;
 
-		switch (g_config.auto_pin) {
+		switch (g_config.auto_pin) { //负载均衡策略
 		case CF_TOPO_AUTO_PIN_NONE:
-			sid = select_sid();
+			sid = select_sid(); //轮询
 			break;
 		case CF_TOPO_AUTO_PIN_CPU:
 		case CF_TOPO_AUTO_PIN_NUMA:
-			sid = select_sid_pinned(cf_topo_socket_cpu(&fd_h->sock));
+			sid = select_sid_pinned(cf_topo_socket_cpu(&fd_h->sock)); //将连接绑定到与客户端 socket 所属 CPU 或 NUMA 节点一致的线程上，提升缓存命中率
 			break;
-		case CF_TOPO_AUTO_PIN_ADQ:
-			sid = select_sid_adq(cf_topo_socket_napi_id(&fd_h->sock));
+		case CF_TOPO_AUTO_PIN_ADQ: 
+			sid = select_sid_adq(cf_topo_socket_napi_id(&fd_h->sock)); //基于网卡硬件队列（NAPI ID）绑定线程，用于高性能网络处理
 			break;
 		default:
 			cf_crash(AS_SERVICE, "bad auto-pin %d", g_config.auto_pin);
 			return;
 		}
 
-		cf_mutex_lock(&g_thread_locks[sid]);
+		cf_mutex_lock(&g_thread_locks[sid]); //epoll使用
 
-		thread_ctx* ctx = g_thread_ctxs[sid];
+		thread_ctx* ctx = g_thread_ctxs[sid]; //线程资源
 
 		if (ctx != NULL) {
 			fd_h->poll = ctx->poll;
@@ -608,28 +608,28 @@ run_service(void* udata)
 
 	cf_detail(AS_SERVICE, "running ctx %p", ctx);
 
-	if (as_config_is_cpu_pinned()) {
-		cf_topo_pin_to_cpu(ctx->i_cpu);
+	if (as_config_is_cpu_pinned()) { 
+		cf_topo_pin_to_cpu(ctx->i_cpu); //绑定cpu
 	}
 
 	cf_poll poll = ctx->poll;
 	cf_epoll_queue* trans_q = &ctx->trans_q;
 
-	cf_poll_add_fd(poll, trans_q->event_fd, EPOLLIN, trans_q);
-	as_xdr_init_poll(poll);
+	cf_poll_add_fd(poll, trans_q->event_fd, EPOLLIN, trans_q); //trans_q 是一个基于 eventfd 的通知机制，当有新的内部事务需要处理时，会通过 eventfd_write() 触发 epoll 事件。
+	as_xdr_init_poll(poll); //注册xdr 相关epoll 事件回调函数 如（异步写入 心跳）
 
 	while (true) {
 		cf_poll_event events[N_EVENTS];
-		int32_t n_events = cf_poll_wait(poll, events, N_EVENTS, -1);
+		int32_t n_events = cf_poll_wait(poll, events, N_EVENTS, -1); //等待事件
 		uint64_t events_ns = cf_getns();
 
 		for (uint32_t i = 0; i < (uint32_t)n_events; i++) {
 			uint32_t mask = events[i].events;
 			void* data = events[i].data;
 
-			uint8_t type = *(uint8_t*)data;
+			uint8_t type = *(uint8_t*)data;  //第一个uint8_t 表示类型
 
-			if (type == CF_POLL_DATA_EPOLL_QUEUE) {
+			if (type == CF_POLL_DATA_EPOLL_QUEUE) { //内部事务
 				cf_assert(mask == EPOLLIN, AS_SERVICE,
 						"unexpected event: 0x%0x", mask);
 
@@ -642,25 +642,25 @@ run_service(void* udata)
 				return NULL;
 			}
 
-			if (type == CF_POLL_DATA_XDR_IO) {
+			if (type == CF_POLL_DATA_XDR_IO) { //XDR 数据
 				as_xdr_io_event(mask, data);
 				continue;
 			}
 
-			if (type == CF_POLL_DATA_XDR_TIMER) {
+			if (type == CF_POLL_DATA_XDR_TIMER) {	//XDR定时器
 				as_xdr_timer_event(events, n_events, i);
 				continue;
 			}
-			// else - type == CF_POLL_DATA_CLIENT_IO
+			// else - type == CF_POLL_DATA_CLIENT_IO  其他为客户端连接事件
 
 			as_file_handle* fd_h = data;
 
-			if ((mask & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)) != 0) {
+			if ((mask & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)) != 0) { //检查连接状态 （关闭 错误 挂起） 释放连接资源
 				service_release_file_handle(fd_h);
 				continue;
 			}
 
-			if (tls_socket_needs_handshake(&fd_h->sock)) {
+			if (tls_socket_needs_handshake(&fd_h->sock)) { //TLS握手处理 
 				int32_t tls_ev = tls_socket_accept(&fd_h->sock);
 
 				if (tls_ev == EPOLLERR) {
@@ -678,27 +678,27 @@ run_service(void* udata)
 				continue;
 			}
 
-			if (fd_h->proto == NULL && fd_h->proto_unread == sizeof(as_proto)) {
+			if (fd_h->proto == NULL && fd_h->proto_unread == sizeof(as_proto)) { //记录请求开始时间
 				// Overload last_used for request start time. Note - latency
 				// will include unrelated events ahead of this one in this loop.
 				fd_h->last_used = events_ns;
 			}
 
-			if (! process_readable(fd_h)) {
+			if (! process_readable(fd_h)) { //读取客户端数据 并解析协议头
 				service_release_file_handle(fd_h);
 				continue;
 			}
 
 			tls_socket_must_not_have_data(&fd_h->sock, "full client read");
 
-			if (fd_h->proto_unread != 0) {
+			if (fd_h->proto_unread != 0) { //未读完 重新注册EPOLLIN事件 等待下次读取
 				rearm(fd_h, EPOLLIN);
 				continue;
 			}
 
 			// Note that epoll cannot trigger again for this file handle during
 			// the transaction. We'll rearm at the end of the transaction.
-			start_transaction(fd_h);
+			start_transaction(fd_h); //开启事务
 		}
 	}
 
@@ -776,15 +776,15 @@ service_release_file_handle(as_file_handle* fd_h)
 }
 
 static bool
-process_readable(as_file_handle* fd_h)
+process_readable(as_file_handle* fd_h) //解析最多2次 第一次proto 然后是body + sz
 {
-	uint8_t* end = fd_h->proto == NULL ?
+	uint8_t* end = fd_h->proto == NULL ? //计算当前buffer的end指针
 			(uint8_t*)&fd_h->proto_hdr + sizeof(as_proto) : // header
 			fd_h->proto->body + fd_h->proto->sz; // body
 
 	while (true) {
 		int32_t sz = cf_socket_recv(&fd_h->sock, end - fd_h->proto_unread,
-				fd_h->proto_unread, 0);
+				fd_h->proto_unread, 0); //读取数据到buffer  （fd_h或者是fd_h->proto->body）
 
 		if (sz < 0) {
 			return errno == EAGAIN || errno == EWOULDBLOCK;
@@ -794,13 +794,13 @@ process_readable(as_file_handle* fd_h)
 			return false;
 		}
 
-		fd_h->proto_unread -= (uint64_t)sz;
+		fd_h->proto_unread -= (uint64_t)sz;	
 
-		if (fd_h->proto_unread != 0) {
+		if (fd_h->proto_unread != 0) { //未读满继续
 			continue; // drain socket (and OpenSSL's internal buffer) dry
 		}
 
-		if (fd_h->proto != NULL) {
+		if (fd_h->proto != NULL) { //第2次读满  返回接受完成
 			return true; // done with entire request
 		}
 		// else - switch from header to body.
@@ -810,9 +810,9 @@ process_readable(as_file_handle* fd_h)
 		//   - tls[1] == ProtocolVersion.major (3)
 		//   - tls[5] == HandshakeType.client_hello (1)
 
-		uint8_t* tls = (uint8_t*)&fd_h->proto_hdr;
+		uint8_t* tls = (uint8_t*)&fd_h->proto_hdr; //协议头读完后 切换body接收模式
 
-		if (tls[0] == 22 && tls[1] == 3 && tls[5] == 1) {
+		if (tls[0] == 22 && tls[1] == 3 && tls[5] == 1) { //非法tls请求忽略
 			cf_warning(AS_SERVICE, "ignoring TLS connection from %s",
 					fd_h->client);
 			return false;
@@ -821,31 +821,31 @@ process_readable(as_file_handle* fd_h)
 		// For backward compatibility, allow version 0 with security messages.
 		if (fd_h->proto_hdr.version != PROTO_VERSION &&
 				! (fd_h->proto_hdr.version == 0 &&
-						fd_h->proto_hdr.type == PROTO_TYPE_SECURITY)) {
+						fd_h->proto_hdr.type == PROTO_TYPE_SECURITY)) { //验证协议和版本
 			cf_warning(AS_SERVICE, "unsupported proto version %d from %s",
 					fd_h->proto_hdr.version, fd_h->client);
 			return false;
 		}
 
-		if (! as_proto_is_valid_type(&fd_h->proto_hdr)) {
+		if (! as_proto_is_valid_type(&fd_h->proto_hdr)) { //判断类型是否支持
 			cf_warning(AS_SERVICE, "unsupported proto type %d from %s",
 					fd_h->proto_hdr.type, fd_h->client);
 			return false;
 		}
 
-		as_proto_swap(&fd_h->proto_hdr);
+		as_proto_swap(&fd_h->proto_hdr); //转换字段顺序 （大小端）
 
-		if (fd_h->proto_hdr.sz > PROTO_SIZE_MAX) {
+		if (fd_h->proto_hdr.sz > PROTO_SIZE_MAX) { //超过协议最大值
 			cf_warning(AS_SERVICE, "invalid proto size %lu from %s",
 					(uint64_t)fd_h->proto_hdr.sz, fd_h->client);
 			return false;
 		}
 
-		fd_h->proto = cf_malloc(sizeof(as_proto) + fd_h->proto_hdr.sz);
+		fd_h->proto = cf_malloc(sizeof(as_proto) + fd_h->proto_hdr.sz); //分配协议内存
 		memcpy(fd_h->proto, &fd_h->proto_hdr, sizeof(as_proto));
 
-		fd_h->proto_unread = fd_h->proto->sz;
-		end = fd_h->proto->body + fd_h->proto->sz;
+		fd_h->proto_unread = fd_h->proto->sz; //重置未读字节数
+		end = fd_h->proto->body + fd_h->proto->sz; //重置最后位置
 	}
 }
 
@@ -853,40 +853,40 @@ static void
 start_transaction(as_file_handle* fd_h)
 {
 	// as_end_of_transaction() rearms then decrements, so this may be > 1.
-	as_incr_uint32(&fd_h->in_transaction);
+	as_incr_uint32(&fd_h->in_transaction); //增加事务计数
 
-	uint64_t start_ns = fd_h->last_used;
-	as_proto* proto = fd_h->proto;
+	uint64_t start_ns = fd_h->last_used; //开始时间 延迟统计用
+	as_proto* proto = fd_h->proto;		 //清空proto,防止被重复使用或释放
 
 	fd_h->proto = NULL;
 	fd_h->proto_unread = sizeof(as_proto);
 
-	if (proto->type == PROTO_TYPE_INFO) {
+	if (proto->type == PROTO_TYPE_INFO) {	//info 管理类请求 （获得配置 节点状态）
 		as_info_transaction it = {
 			.fd_h = fd_h,
 			.proto = proto,
 			.start_time = start_ns
 		};
 
-		as_info(&it);
+		as_info(&it);	//不走标准事务流程
 		return;
 	}
 
-	as_transaction tr;
-	as_transaction_init_head(&tr, NULL, (cl_msg*)proto);
+	as_transaction tr;	//通用事务对象
+	as_transaction_init_head(&tr, NULL, (cl_msg*)proto);//协议头转换成cl_msg 消息格式
 
-	tr.origin = FROM_CLIENT;
+	tr.origin = FROM_CLIENT; //绑定客户端连接信息
 	tr.from.proto_fd_h = fd_h;
 	tr.start_time = start_ns;
 
-	if (proto->type == PROTO_TYPE_SECURITY) {
-		as_security_transact(&tr);
+	if (proto->type == PROTO_TYPE_SECURITY) { //安全事务处理 （用户登录 权限检查）
+		as_security_transact(&tr); //单独处理
 		return;
 	}
 
-	if (proto->type == PROTO_TYPE_AS_MSG_COMPRESSED) {
+	if (proto->type == PROTO_TYPE_AS_MSG_COMPRESSED) { //压缩消息处理
 		uint32_t result = as_proto_uncompress((as_comp_proto*)proto,
-				(as_proto**)&tr.msgp);
+				(as_proto**)&tr.msgp); //解压到tr.msgp
 
 		if (result != AS_OK) {
 			as_transaction_demarshal_error(&tr, result);
@@ -896,22 +896,22 @@ start_transaction(as_file_handle* fd_h)
 		cf_free(proto);
 	}
 
-	if (as_transaction_is_xdr(&tr) && ! fd_h->is_xdr) {
-		config_xdr_socket(&fd_h->sock);
+	if (as_transaction_is_xdr(&tr) && ! fd_h->is_xdr) { //XDR模式切换 如果事务是XDR 但是连接未开启XDR模式  则进行切换
+		config_xdr_socket(&fd_h->sock); //修改socket 一些行为（关闭某些校验）
 		fd_h->is_xdr = true;
 	}
 
-	if (tr.msgp->msg.info1 & AS_MSG_INFO1_BATCH) {
+	if (tr.msgp->msg.info1 & AS_MSG_INFO1_BATCH) { //批量请求处理 提交到批处理队列异步处理  （不立即执行 提高吞吐量）
 		as_batch_queue_task(&tr);
 		return;
 	}
 
-	if (! as_transaction_prepare(&tr, true)) {
+	if (! as_transaction_prepare(&tr, true)) { //事务预处理 （参数校验）
 		as_transaction_demarshal_error(&tr, AS_ERR_PARAMETER);
 		return;
 	}
 
-	as_tsvc_process_transaction(&tr);
+	as_tsvc_process_transaction(&tr); //提交事务给事务服务引擎
 }
 
 static void
@@ -946,7 +946,7 @@ start_reaper(void)
 }
 
 static void*
-run_reaper(void* udata)
+run_reaper(void* udata) //后台管理清理空闲或失效客户端
 {
 	(void)udata;
 

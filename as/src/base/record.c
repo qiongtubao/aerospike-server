@@ -111,21 +111,21 @@ as_record_done(as_index_ref* r_ref, as_namespace* ns)
 {
 	as_record* r = r_ref->r;
 
-	if (! as_index_is_valid_record(r)) {
-		if (r->rc == 0) {
+	if (! as_index_is_valid_record(r)) { //无效
+		if (r->rc == 0) { //没有任何线程正在使用该记录
 			cf_assert(r->in_sindex == 0, AS_RECORD, "bad in_sindex bit");
 
-			as_record_destroy(r, ns);
+			as_record_destroy(r, ns); 	//清理记录
 
-			mrt_free_orig(ns->arena, r, r_ref->puddle);
-			cf_arenax_free(ns->arena, r_ref->r_h, r_ref->puddle);
+			mrt_free_orig(ns->arena, r, r_ref->puddle);				//释放MRT 
+			cf_arenax_free(ns->arena, r_ref->r_h, r_ref->puddle); 	//释放内存池中handle内存
 		}
-		else if (r->in_sindex == 1 && r->rc == 1) {
-			as_sindex_gc_record(ns, r_ref);
+		else if (r->in_sindex == 1 && r->rc == 1) { //在索引中 引用计数只剩1 为什么可以尝试垃圾回收？
+			as_sindex_gc_record(ns, r_ref); //尝试垃圾回收
 		}
 	}
 
-	cf_mutex_unlock(r_ref->olock);
+	cf_mutex_unlock(r_ref->olock); 	//解锁
 }
 
 

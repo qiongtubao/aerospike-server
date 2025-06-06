@@ -57,20 +57,20 @@ typedef bool (*as_sindex_reduce_fn)(struct as_index_ref_s* value, int64_t bval, 
 
 // In header for enterprise separation only - not public.
 
-typedef struct si_btree_s {
-	pthread_rwlock_t lock;
-	cf_arenax* arena;
-	struct as_sindex_arena_s* si_arena;
-	bool unsigned_bvals;
-	uint32_t si_id;
-	uint16_t tree_ix;
-	uint32_t inner_order;
-	uint32_t leaf_order;
-	uint32_t keys_off;
-	uint32_t children_off;
-	si_arena_handle root_h;
-	uint64_t n_nodes;
-	uint64_t n_keys;
+typedef struct si_btree_s { //2级索引树
+	pthread_rwlock_t lock;	//读写锁
+	cf_arenax* arena;		//内存池指针，用于分配节点和记录
+	struct as_sindex_arena_s* si_arena; //指向二级索引的专属内存区域
+	bool unsigned_bvals;	//是否使用无符号比较
+	uint32_t si_id;			//该btree所属的二级索引id
+	uint16_t tree_ix;		//树在分区中的索引
+	uint32_t inner_order;	//b tree 内部节点阶数
+	uint32_t leaf_order;	//b tree 叶子节点阶数
+	uint32_t keys_off;		//keys 数组在节点中的偏移
+	uint32_t children_off;	//子节点数组在节点中的偏移
+	si_arena_handle root_h;	//当前树的根节点 handle
+	uint64_t n_nodes;		//节点总数
+	uint64_t n_keys;		//键值对总数
 } si_btree;
 
 typedef struct si_btree_node_s {

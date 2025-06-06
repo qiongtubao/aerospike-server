@@ -442,27 +442,27 @@ as_sindex_tree_query(as_sindex* si, const as_query_range* range,
 		as_partition_reservation* rsv, int64_t bval, cf_digest* keyd,
 		as_sindex_reduce_fn cb, void* udata)
 {
-	if (si->dropped) {
+	if (si->dropped) { 	//索引被删除
 		return;
 	}
 
-	if (range->bin_type == AS_PARTICLE_TYPE_GEOJSON && range->isrange) {
-		for (uint32_t r_ix = 0; r_ix < range->u.geo.num_r; r_ix++) {
+	if (range->bin_type == AS_PARTICLE_TYPE_GEOJSON && range->isrange) { //是否类型是geojson 且是范围查询
+		for (uint32_t r_ix = 0; r_ix < range->u.geo.num_r; r_ix++) {	//遍历u.geo.r
 			as_query_range_start_end* r = &range->u.geo.r[r_ix];
 
-			if (keyd != NULL && (uint64_t)bval > (uint64_t)r->end) {
+			if (keyd != NULL && (uint64_t)bval > (uint64_t)r->end) { //在范围外 跳过
 				continue;
 			}
 
 			query_reduce(si, rsv, r->start, r->end, bval, keyd, range->de_dup,
-					cb, udata);
+					cb, udata); //进行范围查询
 		}
 
 		return;
 	}
 
 	query_reduce(si, rsv, range->u.r.start, range->u.r.end, bval, keyd,
-			range->de_dup, cb, udata);
+			range->de_dup, cb, udata); //进行范围查询
 }
 
 void
@@ -584,32 +584,32 @@ gc_collect_cb(const si_btree_key* key, void* udata)
 }
 
 static void
-query_reduce(as_sindex* si, as_partition_reservation* rsv, int64_t start_bval,
-		int64_t end_bval, int64_t resume_bval, cf_digest* keyd, bool de_dup,
-		as_sindex_reduce_fn cb, void* udata)
+query_reduce(as_sindex* si /*要查询的二级索引对象 */, as_partition_reservation* rsv /*分区保留结构*/, int64_t start_bval /* 查询起始值 */,
+		int64_t end_bval /* 查询结束值 */, int64_t resume_bval /*恢复点bin值 用于分页*/, cf_digest* keyd /*可选起始digest 分页扫描用*/, bool de_dup /*是否去重*/,
+		as_sindex_reduce_fn cb /* 回调函数 处理每条匹配记录 */, void* udata /*用户上下文数据*/)
 {
 	as_namespace* ns = rsv->ns;
 
-	if (ns->pi_xmem_type == CF_XMEM_TYPE_FLASH) {
+	if (ns->pi_xmem_type == CF_XMEM_TYPE_FLASH) { //flash存储 不需要引用计数
 		query_reduce_no_rc(si, rsv, start_bval, end_bval, resume_bval, keyd,
 				de_dup, cb, udata);
 		return;
 	}
 
-	si_btree* bt = si->btrees[rsv->p->id];
+	si_btree* bt = si->btrees[rsv->p->id]; //获得当前分区对应的btree 索引树 bst/红黑树结构
 	si_btree_key keys[MAX_QUERY_BURST];
 
 	query_collect_cb_info ci = {
-			.arena = bt->arena,
-			.tree = rsv->tree,
-			.keys = keys,
-			.de_dup = de_dup,
-			.last = { .bval = start_bval }
-	};
+			.arena = bt->arena,	//分配器
+			.tree = rsv->tree,	//索引树
+			.keys = keys,	  //buffer 
+			.de_dup = de_dup, //是否去重
+			.last = { .bval = start_bval } //上一次处理的位置
+	}; 	//初始化收集器信息 
 
 	if (keyd != NULL && (bt->unsigned_bvals ?
 			(uint64_t)resume_bval >= (uint64_t)start_bval :
-			resume_bval >= start_bval)) {
+			resume_bval >= start_bval)) { //设置恢复点  分页用
 		ci.last = (search_key){
 				.bval = resume_bval,
 				.has_digest = true,
@@ -620,58 +620,58 @@ query_reduce(as_sindex* si, as_partition_reservation* rsv, int64_t start_bval,
 
 	if (bt->unsigned_bvals ?
 			(uint64_t)ci.last.bval > (uint64_t)end_bval :
-			ci.last.bval > end_bval) {
+			ci.last.bval > end_bval) { //判断是否越界
 		return;
 	}
 
-	search_key end_skey = { .bval = end_bval };
+	search_key end_skey = { .bval = end_bval }; //定义结束搜索点
 
 	while (true) {
-		si_btree_reduce(bt, &ci.last, &end_skey, query_collect_cb, &ci);
+		si_btree_reduce(bt, &ci.last, &end_skey, query_collect_cb, &ci); //搜索
 
 		bool do_more = true;
 
-		for (uint32_t i = 0; i < ci.n_keys; i++) {
+		for (uint32_t i = 0; i < ci.n_keys; i++) {	//遍历搜索结果匹配
 			if (si->dropped) {
 				do_more = false;
 			}
 
 			si_btree_key* key = &keys[i];
 
-			as_record* r = cf_arenax_resolve(bt->arena, key->r_h);
+			as_record* r = cf_arenax_resolve(bt->arena, key->r_h); //转换成实际指针
 			as_index_ref r_ref = {
 					.r = r,
 					.r_h = key->r_h,
 					.olock = as_index_olock_from_keyd(rsv->tree, &r->keyd)
 			};
 
-			cf_mutex_lock(r_ref.olock);
+			cf_mutex_lock(r_ref.olock); //加锁 防止并发删除或者修改
 
-			as_index_release(r);
+			as_index_release(r);	//减少引用
 
-			if (! as_index_is_valid_record(r)) {
-				as_record_done(&r_ref, ns);
+			if (! as_index_is_valid_record(r)) { //无效
+				as_record_done(&r_ref, ns);	//释放掉
 				continue;
 			}
 
 			if (do_more) {
 				// Callback MUST call as_record_done() to unlock record.
-				do_more = cb(&r_ref, key->bval, udata);
+				do_more = cb(&r_ref, key->bval, udata); //回调
 			}
 			else {
-				cf_mutex_unlock(r_ref.olock);
+				cf_mutex_unlock(r_ref.olock); //解锁
 			}
 		}
 
-		if (! do_more) {
+		if (! do_more) { //收集结束
 			return; // user callback or sindex drop stopped query
 		}
 
-		if (ci.n_keys_reduced != MAX_QUERY_BURST) {
+		if (ci.n_keys_reduced != MAX_QUERY_BURST) { //没有更多结果了
 			return; // done with this physical tree
 		}
 
-		ci.n_keys_reduced = 0;
+		ci.n_keys_reduced = 0; //清空 继续下一轮
 		ci.n_keys = 0;
 	}
 }

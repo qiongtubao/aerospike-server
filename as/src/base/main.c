@@ -29,6 +29,7 @@ extern int as_run(int argc, char** argv);
 
 //==========================================================
 // Public API - Main entry point.
+// 进程入口：仅调用 as_run，所有初始化与事件循环均在 as_run 内完成。
 //
 
 int

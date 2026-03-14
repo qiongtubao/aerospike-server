@@ -1,6 +1,61 @@
 /*
  * write.c
  *
+ * Aerospike 写事务处理核心模块
+ * 负责处理所有写操作：包括客户端写入、代理写入、批量子请求写入等
+ *
+ * =============================================================================
+ * 模块功能说明：
+ *
+ * 本模块是 Aerospike 数据库写操作的核心处理引擎，负责处理所有类型的写事务。
+ *
+ * 主要职责：
+ * 1. 写事务生命周期管理 - 从请求接收到响应发送的完整流程
+ * 2. 副本解析与一致性保证 - 确保多副本间的数据一致性
+ * 3. 主副本写入协调 - 管理主节点和副本节点的写入顺序
+ * 4. Bin操作执行引擎 - 处理各种数据类型的写入操作
+ * 5. 超时和错误处理 - 保证写操作的可靠性和及时性
+ * 6. XDR集成 - 跨数据中心复制的写入事件处理
+ * 7. 二级索引更新 - 维护索引的一致性
+ * 8. 存储引擎集成 - 与底层存储系统的交互
+ *
+ * 关键数据流：
+ * 客户端写请求 → as_write_start() → [副本解析] → write_master() →
+ * [bin操作执行] → [副本同步] → [索引更新] → [XDR通知] → 响应发送
+ *
+ * 状态机转换图：
+ * START → 权限验证 → {
+ *   需要副本解析 → dup_res → write_master → MASTER_PROCESSING
+ *   直接写入 → write_master → MASTER_PROCESSING
+ * }
+ *
+ * MASTER_PROCESSING → bin操作执行 → {
+ *   成功 → 副本同步 → REPL_WRITE
+ *   失败 → 错误处理 → DONE_ERROR
+ * }
+ *
+ * REPL_WRITE → 等待副本响应 → {
+ *   所有副本成功 → 索引更新 → XDR通知 → DONE_SUCCESS
+ *   副本失败/超时 → 错误处理 → DONE_ERROR
+ *   部分成功 → 根据配置决定 → DONE_SUCCESS/DONE_ERROR
+ * }
+ *
+ * 主要状态：
+ * - TRANS_IN_PROGRESS: 事务正在异步处理中
+ * - TRANS_WAITING: 等待其他资源或操作完成
+ * - TRANS_DONE_SUCCESS: 写操作成功完成
+ * - TRANS_DONE_ERROR: 写操作失败
+ *
+ * 核心函数：
+ * 1. as_write_start() - 写事务入口点，负责初始化和流程控制
+ * 2. write_dup_res_start_cb() - 副本解析启动回调
+ * 3. write_master() - 主副本写入处理核心逻辑
+ * 4. write_master_bin_ops() - bin操作执行引擎
+ * 5. write_repl_write_cb() - 副本写入完成回调
+ * 6. write_timeout_cb() - 超时处理回调
+ * 7. write_done_cb() - 写操作完成清理回调
+ * =============================================================================
+ *
  * Copyright (C) 2016-2021 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
@@ -64,158 +119,310 @@
 
 
 //==========================================================
+// 类型定义和常量
 // Typedefs & constants.
 //
 
+// 单个事务允许的最大操作数量 (32K)
 #define MAX_N_OPS (32 * 1024)
 
+// 编译时断言：确保记录最大 bin 数量加上最大操作数不超过 64K 限制
 COMPILER_ASSERT(RECORD_MAX_BINS + MAX_N_OPS < 64 * 1024);
 
+// 栈上分配的粒子缓冲区大小 (1MB) - 用于临时存储 bin 数据
 #define STACK_PARTICLES_SIZE (1024 * 1024)
 
 
 //==========================================================
+// 前向声明 - 定义本文件中主要函数的接口
 // Forward declarations.
 //
 
+// 重复解析相关回调函数
 static void write_dup_res_start_cb(rw_request* rw, as_transaction* tr, as_record* r);
+static bool write_dup_res_cb(rw_request* rw);
+
+// 副本写入相关函数
 static void start_write_repl_write(rw_request* rw, as_transaction* tr);
 static void start_write_repl_write_forget(rw_request* rw, as_transaction* tr);
-static bool write_dup_res_cb(rw_request* rw);
 static void write_repl_write_after_dup_res(rw_request* rw, as_transaction* tr);
 static void write_repl_write_forget_after_dup_res(rw_request* rw, as_transaction* tr);
 static void write_repl_write_cb(rw_request* rw);
 
+// 响应发送和超时处理
 static void send_write_response(as_transaction* tr, cf_dyn_buf* db);
 static void write_timeout_cb(rw_request* rw);
 
+// 主副本写入核心逻辑
 static transaction_status write_master(rw_request* rw, as_transaction* tr);
 static void write_master_failed(as_transaction* tr, as_index_ref* r_ref, bool record_created, as_index_tree* tree, as_storage_rd* rd, int result_code);
 static int write_master_preprocessing(as_transaction* tr);
 static int write_master_policies(as_transaction* tr, bool* p_must_not_create, bool* p_is_replace);
 static bool check_msg_set_name(as_transaction* tr, const char* set_name);
 static int write_master_apply(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd, bool is_replace, rw_request* rw, bool* is_delete);
+
+// Bin 操作处理函数
 static int write_master_bin_ops(as_transaction* tr, as_storage_rd* rd, cf_ll_buf* particles_llb, cf_dyn_buf* db);
 static int write_master_bin_ops_loop(as_transaction* tr, as_storage_rd* rd, as_msg_op** ops, as_bin* response_bins, uint32_t* p_n_response_bins, as_bin* result_bins, uint32_t* p_n_result_bins, cf_ll_buf* particles_llb);
 
 
 //==========================================================
+// 内联函数和宏定义 - 统计信息更新辅助函数
 // Inlines & macros.
 //
 
+/**
+ * 更新客户端写操作统计信息
+ * @param ns 命名空间指针
+ * @param result_code 操作结果码
+ * @param is_xdr_op 是否为 XDR 操作
+ */
+//==========================================================
+// 内联函数 - 统计信息更新
+//
+
+/**
+ * 更新客户端写操作统计信息
+ *
+ * @param ns 命名空间对象
+ * @param result_code 操作结果码
+ * @param is_xdr_op 是否为XDR操作
+ *
+ * 功能说明：
+ * 根据写操作的结果更新相应的统计计数器，用于监控和性能分析。
+ * 区分普通写入和XDR写入的统计信息。
+ *
+ * 统计类别：
+ * - 成功写入：n_client_write_success / n_xdr_write_success
+ * - 一般错误：n_client_write_error / n_xdr_write_error
+ * - 超时错误：n_client_write_timeout / n_xdr_write_timeout
+ * - 记录不存在：仅普通写入统计
+ * - 过滤排除：仅普通写入统计
+ */
 static inline void
 client_write_update_stats(as_namespace* ns, uint8_t result_code, bool is_xdr_op)
 {
 	switch (result_code) {
 	case AS_OK:
+		// 写入成功统计
 		as_incr_uint64(&ns->n_client_write_success);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_client_write_success);
 		}
 		break;
 	default:
+		// 写入错误统计
 		as_incr_uint64(&ns->n_client_write_error);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_client_write_error);
 		}
 		break;
 	case AS_ERR_TIMEOUT:
+		// 写入超时统计
 		as_incr_uint64(&ns->n_client_write_timeout);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_client_write_timeout);
 		}
 		break;
 	case AS_ERR_FILTERED_OUT:
+		// 被过滤器过滤掉的写入（不能是 XDR 写入）
 		// Can't be an XDR write.
 		as_incr_uint64(&ns->n_client_write_filtered_out);
 		break;
 	}
 }
 
+/**
+ * 更新来自代理的写操作统计信息
+ * @param ns 命名空间指针
+ * @param result_code 操作结果码
+ * @param is_xdr_op 是否为 XDR 操作
+ */
+/**
+ * 更新代理节点写操作统计信息
+ *
+ * @param ns 命名空间对象
+ * @param result_code 操作结果码
+ * @param is_xdr_op 是否为XDR操作
+ *
+ * 功能说明：
+ * 当写请求来自代理节点时，更新相应的统计信息。
+ * 代理写入通常发生在分区迁移或负载均衡场景中。
+ *
+ * 统计类别：
+ * - 成功写入：n_from_proxy_write_success / n_from_proxy_xdr_write_success
+ * - 一般错误：n_from_proxy_write_error / n_from_proxy_xdr_write_error
+ * - 超时错误：n_from_proxy_write_timeout / n_from_proxy_xdr_write_timeout
+ * - 记录不存在：仅普通写入统计
+ * - 过滤排除：仅普通写入统计
+ */
 static inline void
 from_proxy_write_update_stats(as_namespace* ns, uint8_t result_code,
 		bool is_xdr_op)
 {
 	switch (result_code) {
 	case AS_OK:
+		// 代理写入成功统计
 		as_incr_uint64(&ns->n_from_proxy_write_success);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_from_proxy_write_success);
 		}
 		break;
 	default:
+		// 代理写入错误统计
 		as_incr_uint64(&ns->n_from_proxy_write_error);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_from_proxy_write_error);
 		}
 		break;
 	case AS_ERR_TIMEOUT:
+		// 代理写入超时统计
 		as_incr_uint64(&ns->n_from_proxy_write_timeout);
 		if (is_xdr_op) {
 			as_incr_uint64(&ns->n_xdr_from_proxy_write_timeout);
 		}
 		break;
 	case AS_ERR_FILTERED_OUT:
+		// 代理写入被过滤统计（不能是 XDR 写入）
 		// Can't be an XDR write.
 		as_incr_uint64(&ns->n_from_proxy_write_filtered_out);
 		break;
 	}
 }
 
+/**
+ * 更新批量子写操作统计信息（不能是 XDR 写入）
+ * @param ns 命名空间指针
+ * @param result_code 操作结果码
+ */
 // Can't be an XDR write.
+/**
+ * 更新批处理子写操作统计信息
+ *
+ * @param ns 命名空间对象
+ * @param result_code 操作结果码
+ *
+ * 功能说明：
+ * 批处理操作中每个子写操作的统计信息更新。
+ * 批处理写入可以显著提高吞吐量，但需要单独统计每个子操作的结果。
+ *
+ * 统计类别：
+ * - 成功写入：n_batch_sub_write_success
+ * - 一般错误：n_batch_sub_write_error
+ * - 超时错误：n_batch_sub_write_timeout
+ * - 记录不存在：n_batch_sub_write_not_found
+ * - 过滤排除：n_batch_sub_write_filtered_out
+ */
 static inline void
 batch_sub_write_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
 	case AS_OK:
+		// 批量子写入成功统计
 		as_incr_uint64(&ns->n_batch_sub_write_success);
 		break;
 	default:
+		// 批量子写入错误统计
 		as_incr_uint64(&ns->n_batch_sub_write_error);
 		break;
 	case AS_ERR_TIMEOUT:
+		// 批量子写入超时统计
 		as_incr_uint64(&ns->n_batch_sub_write_timeout);
 		break;
 	case AS_ERR_FILTERED_OUT:
+		// 批量子写入被过滤统计
 		as_incr_uint64(&ns->n_batch_sub_write_filtered_out);
 		break;
 	}
 }
 
+/**
+ * 更新来自代理的批量子写操作统计信息（不能是 XDR 写入）
+ * @param ns 命名空间指针
+ * @param result_code 操作结果码
+ */
 // Can't be an XDR write.
+/**
+ * 更新来自代理的批处理子写操作统计信息
+ *
+ * @param ns 命名空间对象
+ * @param result_code 操作结果码
+ *
+ * 功能说明：
+ * 当批处理写请求来自代理节点时的统计信息更新。
+ * 这种情况通常发生在跨节点的批处理操作中。
+ *
+ * 统计类别：
+ * - 成功写入：n_from_proxy_batch_sub_write_success
+ * - 一般错误：n_from_proxy_batch_sub_write_error
+ * - 超时错误：n_from_proxy_batch_sub_write_timeout
+ * - 记录不存在：n_from_proxy_batch_sub_write_not_found
+ * - 过滤排除：n_from_proxy_batch_sub_write_filtered_out
+ */
 static inline void
 from_proxy_batch_sub_write_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
 	case AS_OK:
+		// 来自代理的批量子写入成功统计
 		as_incr_uint64(&ns->n_from_proxy_batch_sub_write_success);
 		break;
 	default:
+		// 来自代理的批量子写入错误统计
 		as_incr_uint64(&ns->n_from_proxy_batch_sub_write_error);
 		break;
 	case AS_ERR_TIMEOUT:
+		// 来自代理的批量子写入超时统计
 		as_incr_uint64(&ns->n_from_proxy_batch_sub_write_timeout);
 		break;
 	case AS_ERR_FILTERED_OUT:
+		// 来自代理的批量子写入被过滤统计
 		as_incr_uint64(&ns->n_from_proxy_batch_sub_write_filtered_out);
 		break;
 	}
 }
 
+/**
+ * 更新操作子写入统计信息
+ * @param ns 命名空间指针
+ * @param result_code 操作结果码
+ */
+/**
+ * 更新操作子写入统计信息
+ *
+ * @param ns 命名空间对象
+ * @param result_code 操作结果码
+ *
+ * 功能说明：
+ * 更新来自内部操作系统（如IOP - Internal Operations）的写入统计。
+ * 这些操作通常是系统内部触发的写入，如数据迁移、修复等。
+ *
+ * 统计类别：
+ * - 成功写入：n_ops_sub_write_success
+ * - 一般错误：n_ops_sub_write_error
+ * - 超时错误：n_ops_sub_write_timeout
+ * - 记录不存在：n_ops_sub_write_not_found
+ * - 过滤排除：n_ops_sub_write_filtered_out
+ */
 static inline void
 ops_sub_write_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
 	case AS_OK:
+		// 操作子写入成功统计
 		as_incr_uint64(&ns->n_ops_sub_write_success);
 		break;
 	default:
+		// 操作子写入错误统计
 		as_incr_uint64(&ns->n_ops_sub_write_error);
 		break;
 	case AS_ERR_TIMEOUT:
+		// 操作子写入超时统计
 		as_incr_uint64(&ns->n_ops_sub_write_timeout);
 		break;
-	case AS_ERR_FILTERED_OUT: // doesn't include those filtered out by metadata
+	case AS_ERR_FILTERED_OUT: // 不包括元数据过滤的情况
+		// 操作子写入被过滤统计
+		// doesn't include those filtered out by metadata
 		as_incr_uint64(&ns->n_ops_sub_write_filtered_out);
 		break;
 	}
@@ -226,13 +433,79 @@ ops_sub_write_update_stats(as_namespace* ns, uint8_t result_code)
 // Public API.
 //
 
+//==========================================================
+// 公共 API - 写事务处理主入口
+// Public API.
+//
+
+/**
+ * 写事务入口函数：所有写操作（客户端/代理/批量子请求）的统一入口
+ *
+ * 主要处理流程：
+ * 1. XDR 过滤检查和存储过载检查
+ * 2. 创建 rw_request 并插入到哈希表中用于重复检测
+ * 3. 可选的重复解析处理（如果存在重复写入）
+ * 4. 在主副本上执行写操作
+ * 5. 可选的副本写入处理
+ *
+ * @param tr 事务对象指针，包含写入请求的所有信息
+ * @return transaction_status 事务状态：
+ *         - TRANS_DONE_SUCCESS: 写入成功完成
+ *         - TRANS_DONE_ERROR: 写入失败
+ *         - TRANS_IN_PROGRESS: 写入正在进行中（等待副本确认）
+ *         - TRANS_WAITING: 事务等待中（重复解析或其他阻塞情况）
+ *
+ * 关键逻辑：
+ * - 使用 (namespace_ix, key_digest) 作为哈希键确保同一记录的并发写入被正确排序
+ * - 支持重复解析机制处理分区副本间的写入冲突
+ * - 根据一致性策略决定是否等待副本写入确认
+ */
+/**
+ * 启动写事务处理流程
+ *
+ * @param tr 事务对象指针
+ * @return transaction_status 事务状态
+ *   - TRANS_IN_PROGRESS: 事务正在异步处理中
+ *   - TRANS_DONE_SUCCESS: 写操作成功完成
+ *   - TRANS_DONE_ERROR: 写操作失败
+ *   - TRANS_WAITING: 事务等待中（重新排队）
+ *
+ * 功能说明：
+ * 这是写操作的主入口点，负责：
+ * 1. 执行预处理检查（时钟偏斜、操作数量等）
+ * 2. 应用写入策略和权限检查
+ * 3. 判断是否需要进行副本解析
+ * 4. 创建或找到 rw_request 并管理并发控制
+ * 5. 根据需要启动副本解析或直接进入写入流程
+ * 6. 处理各种错误情况和异常场景
+ *
+ * 状态机转换：
+ * START → 预处理检查 → {
+ *   检查失败 → send_write_response(错误) → DONE_ERROR
+ *   检查通过 → 判断副本解析需求 → {
+ *     无需解析 → write_master → MASTER_PROCESSING → {
+ *       成功 → 副本写入 → REPL_WRITE → DONE_SUCCESS
+ *       失败 → DONE_ERROR
+ *     }
+ *     需要解析 → dup_res_start → IN_PROGRESS → write_dup_res_cb
+ *     哈希冲突 → WAITING（重新排队）
+ *   }
+ * }
+ *
+ * 关键控制点：
+ * - rw_request哈希表插入：防止并发写入冲突
+ * - 副本解析决策：基于一致性策略和副本状态
+ * - 错误处理路径：确保资源正确释放和响应发送
+ */
 transaction_status
 as_write_start(as_transaction* tr)
 {
+	// 性能基准测试点记录
 	BENCHMARK_START(tr, write, FROM_CLIENT);
 	BENCHMARK_START_FROM_BATCH(tr);
 	BENCHMARK_START(tr, ops_sub, FROM_IOPS);
 
+	// XDR 过滤器检查：某些写入可能被 XDR 策略禁止
 	// Apply XDR filter.
 	if (! xdr_allows_write(tr)) {
 		tr->result_code = AS_ERR_FORBIDDEN;
@@ -240,6 +513,7 @@ as_write_start(as_transaction* tr)
 		return TRANS_DONE_ERROR;
 	}
 
+	// 存储过载检查：防止在存储系统过载时接受新的写入请求
 	// Check that we aren't backed up.
 	if (as_storage_overloaded(tr->rsv.ns, 0, "write")) {
 		tr->result_code = AS_ERR_DEVICE_OVERLOAD;
@@ -247,11 +521,13 @@ as_write_start(as_transaction* tr)
 		return TRANS_DONE_ERROR;
 	}
 
+	// 按 (namespace_ix, key_digest) 创建 rw_request 并插入哈希，用于同一 key 的并发写合并与重复解析。
 	// Create rw_request and add to hash.
 	rw_request_hkey hkey = { tr->rsv.ns->ix, tr->keyd };
 	rw_request* rw = rw_request_create(&tr->keyd);
 	transaction_status status = rw_request_hash_insert(&hkey, rw, tr);
 
+	// 如果 rw_request 未能插入哈希表，说明已有相同 key 的事务在处理，当前事务结束
 	// If rw_request wasn't inserted in hash, transaction is finished.
 	if (status != TRANS_IN_PROGRESS) {
 		rw_request_release(rw);
@@ -264,24 +540,29 @@ as_write_start(as_transaction* tr)
 	}
 	// else - rw_request is now in hash, continue...
 
+	// 如果命名空间禁用了重复解析，清零重复计数
 	if (tr->rsv.ns->write_dup_res_disabled) {
 		// Note - preventing duplicate resolution this way allows
 		// rw_request_destroy() to handle dup_msg[] cleanup correctly.
 		tr->rsv.n_dupl = 0;
 	}
 
+	// 若存在重复写（同一 partition 多副本收到写），先做重复解析；否则直接在 master 上执行写。
 	// If there are duplicates to resolve, start doing so.
 	if (tr->rsv.n_dupl != 0 && dup_res_start(rw, tr, write_dup_res_start_cb)) {
 		return TRANS_IN_PROGRESS; // started duplicate resolution
 	}
 	// else - no duplicate resolution phase, apply operation to master.
 
+	// 在 master 分区上执行写：索引查找/创建、bin 操作、落盘、副本发送。
 	status = write_master(rw, tr);
 
+	// 性能基准测试点记录
 	BENCHMARK_NEXT_DATA_POINT_FROM(tr, write, FROM_CLIENT, master);
 	BENCHMARK_NEXT_DATA_POINT_FROM(tr, batch_sub, FROM_BATCH, write_master);
 	BENCHMARK_NEXT_DATA_POINT_FROM(tr, ops_sub, FROM_IOPS, master);
 
+	// 如果写入主副本失败，事务结束
 	// If error, transaction is finished.
 	if (status != TRANS_IN_PROGRESS) {
 		rw_request_hash_delete(&hkey, rw);
@@ -293,6 +574,7 @@ as_write_start(as_transaction* tr)
 		return status;
 	}
 
+	// 如果不需要副本写入，事务完成
 	// If we don't need replica writes, transaction is finished.
 	if (rw->n_dest_nodes == 0) {
 		finished_replicated(tr);
@@ -301,6 +583,7 @@ as_write_start(as_transaction* tr)
 		return TRANS_DONE_SUCCESS;
 	}
 
+	// 如果不需要等待副本写入确认，采用"即发即忘"模式
 	// If we don't need to wait for replica write acks, fire and forget.
 	if (respond_on_master_complete(tr)) {
 		start_write_repl_write_forget(rw, tr);
@@ -309,6 +592,7 @@ as_write_start(as_transaction* tr)
 		return TRANS_DONE_SUCCESS;
 	}
 
+	// 启动副本写入，等待确认
 	start_write_repl_write(rw, tr);
 
 	// Started replica write.
@@ -320,6 +604,29 @@ as_write_start(as_transaction* tr)
 // Local helpers - transaction flow.
 //
 
+/**
+ * 副本解析启动回调函数
+ *
+ * @param rw rw_request对象
+ * @param tr 事务对象
+ * @param r 记录对象（可能为NULL）
+ *
+ * 功能说明：
+ * 当需要进行副本解析时被调用，负责：
+ * 1. 完成rw_request的初始化设置
+ * 2. 构造副本解析消息
+ * 3. 发送消息到相关副本节点
+ * 4. 设置回调函数等待响应
+ *
+ * 处理流程：
+ * 1. 调用 dup_res_make_message() 构造解析消息
+ * 2. 获取rw锁保护并发访问
+ * 3. 设置副本解析参数和回调函数
+ * 4. 发送消息到目标节点
+ * 5. 释放锁，等待异步响应
+ *
+ * 状态机转换：副本解析启动 → 消息发送 → 等待响应 → write_dup_res_cb
+ */
 static void
 write_dup_res_start_cb(rw_request* rw, as_transaction* tr, as_record* r)
 {
@@ -359,6 +666,38 @@ start_write_repl_write_forget(rw_request* rw, as_transaction* tr)
 	send_rw_messages_forget(rw);
 }
 
+/**
+ * 副本解析完成回调函数
+ *
+ * @param rw rw_request对象
+ * @return bool 是否完成事务处理（true=完成，false=继续异步处理）
+ *
+ * 功能说明：
+ * 副本解析完成后被调用，负责：
+ * 1. 检查解析结果和错误状态
+ * 2. 决定下一步处理流程
+ * 3. 根据副本策略选择写入或忘记模式
+ * 4. 启动主副本写入操作
+ *
+ * 处理流程：
+ * 1. 更新性能基准测试点
+ * 2. 从rw_request重建事务对象
+ * 3. 检查副本解析是否成功
+ * 4. 根据副本写入策略选择处理方式：
+ *    - 需要等待副本确认：启动副本写入并等待
+ *    - 忘记模式：发送副本写入但不等待确认
+ * 5. 执行主副本写入操作
+ *
+ * 状态机转换：
+ * 副本解析完成 → 检查结果 → {
+ *   失败 → 发送错误响应 → 结束(true)
+ *   成功 → 选择副本策略 → {
+ *     需要等待 → 启动副本写入 → 继续异步(false)
+ *     忘记模式 → 启动忘记副本写入 → 继续异步(false)
+ *     无副本写入 → 主副本写入 → 结束(true)
+ *   }
+ * }
+ */
 static bool
 write_dup_res_cb(rw_request* rw)
 {
@@ -433,6 +772,41 @@ write_repl_write_forget_after_dup_res(rw_request* rw, as_transaction* tr)
 	send_rw_messages_forget(rw);
 }
 
+/**
+ * 副本写入完成回调函数
+ *
+ * @param rw rw_request对象
+ *
+ * 功能说明：
+ * 当副本写入操作完成时被调用，负责：
+ * 1. 检查所有副本的写入结果
+ * 2. 决定整个写操作是否成功
+ * 3. 根据一致性策略处理部分失败的情况
+ * 4. 执行主副本写入操作
+ * 5. 发送最终响应给客户端
+ *
+ * 处理流程：
+ * 1. 更新性能基准测试点
+ * 2. 从rw_request重建事务对象
+ * 3. 检查副本写入状态：
+ *    - 统计成功和失败的副本数量
+ *    - 根据一致性策略判断是否满足要求
+ * 4. 如果副本写入满足要求，执行主副本写入
+ * 5. 处理错误情况，发送适当的错误响应
+ *
+ * 一致性策略处理：
+ * - ALL: 所有副本都必须成功
+ * - MAJORITY: 大多数副本成功即可
+ * - ONE: 至少一个副本成功
+ * - 根据失败的副本数量和策略决定写入成功与否
+ *
+ * 状态机转换：
+ * 副本写入完成 → 检查副本结果 → {
+ *   满足一致性要求 → 主副本写入 → 发送成功响应
+ *   不满足要求 → 发送失败响应
+ *   部分成功 → 根据策略决定 → 成功/失败响应
+ * }
+ */
 static void
 write_repl_write_cb(rw_request* rw)
 {
@@ -531,6 +905,37 @@ send_write_response(as_transaction* tr, cf_dyn_buf* db)
 	tr->from.any = NULL; // pattern, not needed
 }
 
+/**
+ * 写操作超时处理回调函数
+ *
+ * @param rw rw_request对象
+ *
+ * 功能说明：
+ * 当写操作超时时被调用，负责：
+ * 1. 检查是否与其他回调函数发生竞争
+ * 2. 根据请求来源发送相应的超时错误响应
+ * 3. 更新超时相关的统计信息
+ * 4. 标记竞争状态以防止重复处理
+ *
+ * 处理逻辑：
+ * 1. 检查 rw->from.any 是否为空（竞争检测）
+ * 2. 根据请求来源发送超时响应：
+ *    - FROM_CLIENT: 向客户端发送超时回复
+ *    - FROM_PROXY: 更新代理相关统计（不发送响应）
+ *    - FROM_BATCH: 向批处理添加超时错误
+ * 3. 更新命名空间的超时统计计数器
+ * 4. 设置 rw->from.any = NULL 通知其他回调竞争失败
+ *
+ * 竞争处理：
+ * - 与副本解析回调的竞争
+ * - 与副本写入回调的竞争
+ * - 使用原子操作确保只有一个回调处理响应
+ *
+ * 注意事项：
+ * - 超时的操作不包含在性能直方图统计中
+ * - 代理请求的超时由代理节点负责处理响应
+ * - 批处理请求需要特殊的错误处理格式
+ */
 static void
 write_timeout_cb(rw_request* rw)
 {
@@ -581,6 +986,72 @@ write_timeout_cb(rw_request* rw)
 // Local helpers - write master.
 //
 
+/*
+ * 在 master 分区上执行写：预处理 -> 策略与 set 校验 -> 索引查找或创建并加锁 ->
+ * 打开/创建 as_storage_rd -> 执行 bin 操作并落盘(write_master_apply) -> 副本/XDR。
+ */
+/**
+ * 执行主副本写入操作
+ *
+ * @param rw rw_request对象，包含写入请求的上下文信息
+ * @param tr 事务对象，包含写入操作的详细信息
+ * @return transaction_status 事务状态
+ *   - TRANS_DONE_SUCCESS: 写操作成功完成
+ *   - TRANS_DONE_ERROR: 写操作失败
+ *   - TRANS_WAITING: 需要重新排队等待
+ *
+ * 功能说明：
+ * 这是写操作的核心执行函数，负责在主副本上执行实际的写入操作：
+ * 1. 执行预处理检查（不需要循环操作或创建/查找索引的检查）
+ * 2. 应用写入策略和验证规则
+ * 3. 查找或创建记录索引
+ * 4. 执行bin操作（写入、更新、删除等）
+ * 5. 处理存储引擎交互
+ * 6. 管理记录生命周期（创建、更新、删除）
+ * 7. 触发后续的副本同步和索引更新
+ *
+ * 处理流程：
+ * 1. 预处理阶段 - write_master_preprocessing():
+ *    - 检查时钟偏斜限制
+ *    - 验证操作数量和消息格式
+ *
+ * 2. 策略应用阶段 - write_master_policies():
+ *    - 解析写入策略（must_not_create, replace等）
+ *    - 验证条件写入要求
+ *
+ * 3. 索引操作阶段：
+ *    - 在主索引中查找或创建记录
+ *    - 获取记录锁以确保原子性
+ *    - 检查记录状态（过期、删除、副本状态等）
+ *
+ * 4. 存储操作阶段：
+ *    - 打开存储记录描述符
+ *    - 加载现有bin数据
+ *    - 准备写入环境
+ *
+ * 5. 应用操作阶段 - write_master_apply():
+ *    - 验证条件写入要求（generation、TTL等）
+ *    - 执行所有bin操作
+ *    - 更新记录元数据
+ *
+ * 6. 完成阶段：
+ *    - 提交存储更改
+ *    - 更新索引和统计信息
+ *    - 触发XDR和二级索引更新
+ *    - 启动副本同步或发送响应
+ *
+ * 错误处理：
+ * - 任何阶段的错误都会调用 write_master_failed()
+ * - 确保正确释放锁和资源
+ * - 向客户端发送适当的错误响应
+ *
+ * 状态机转换：
+ * MASTER_START → 预处理 → 策略检查 → 索引查找 → 存储操作 → bin操作执行 → {
+ *   成功 → 副本同步启动 → 返回成功
+ *   失败 → 错误清理 → 返回错误
+ *   需要重排队 → 返回等待状态
+ * }
+ */
 static transaction_status
 write_master(rw_request* rw, as_transaction* tr)
 {
@@ -837,6 +1308,7 @@ write_master(rw_request* rw, as_transaction* tr)
 	uint64_t prev_lut = r->last_update_time;
 
 	//------------------------------------------------------
+	// 执行 bin 操作并提交到存储：加载旧 bins、应用消息中的 op、写入设备、更新 sindex。
 	// Handle bin operations and commit master.
 	//
 
@@ -1142,6 +1614,11 @@ check_msg_set_name(as_transaction* tr, const char* set_name)
 	return true;
 }
 
+/*
+ * 将本次写操作应用到主副本：从设备加载 bins -> 准备元数据 -> 执行 bin ops -> 判删 ->
+ * 调用 as_storage_record_write 落盘 -> 更新 sindex/索引。
+ * 数据实际写入由 as_storage_record_write(rd) 根据 ns->storage_type 分发到 mem/ssd/pmem。
+ */
 static int
 write_master_apply(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 		bool is_replace, rw_request* rw, bool* is_delete)
@@ -1158,6 +1635,7 @@ write_master_apply(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 
 	as_bin stack_bins[RECORD_MAX_BINS + m->n_ops];
 
+	// 从存储引擎加载当前记录的 bins（mem 从 mwb 读、ssd 从块读等）。
 	int result = as_storage_rd_load_bins(rd, stack_bins);
 
 	if (result < 0) {
@@ -1239,6 +1717,8 @@ write_master_apply(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 			*is_delete && rd->n_bins != 0);
 
 	//------------------------------------------------------
+	// 将记录写入存储：根据 namespace 的 storage_type 调用 mem/ssd/pmem 的写实现；
+	// 内部会把 rd 中的 bins 打包成 as_flat_record 写入写块缓冲区（或 SSD 写块）。
 	// Write the record to storage.
 	//
 
@@ -1281,6 +1761,54 @@ write_master_apply(as_transaction* tr, as_index_ref* r_ref, as_storage_rd* rd,
 	return 0;
 }
 
+/**
+ * 执行写入操作的bin级别操作
+ *
+ * @param tr 事务对象
+ * @param rd 存储记录描述符
+ * @param particles_llb 粒子链式缓冲区，用于临时存储
+ * @param db 动态缓冲区，用于构造响应
+ * @return int 操作结果码（0=成功，负值=错误码）
+ *
+ * 功能说明：
+ * 这是bin操作的核心执行引擎，负责：
+ * 1. 解析和验证消息中的所有操作
+ * 2. 为每个操作分配响应和结果bin
+ * 3. 调用操作循环处理每个bin操作
+ * 4. 构造操作响应消息
+ * 5. 处理批处理和非批处理请求的不同响应格式
+ *
+ * 支持的操作类型：
+ * - AS_MSG_OP_WRITE: 普通写入/更新操作
+ * - AS_MSG_OP_INCR: 原子增减操作
+ * - AS_MSG_OP_APPEND/PREPEND: 字符串追加操作
+ * - AS_MSG_OP_BITS_*: 位操作
+ * - AS_MSG_OP_HLL_*: HyperLogLog操作
+ * - AS_MSG_OP_CDT_*: 复杂数据类型操作（List/Map）
+ * - AS_MSG_OP_EXP_*: 表达式操作
+ * - AS_MSG_OP_DELETE: 删除操作
+ * - AS_MSG_OP_TOUCH: 触摸操作（更新TTL）
+ *
+ * 处理流程：
+ * 1. 验证操作数量和消息格式
+ * 2. 分配操作、响应和结果bin数组
+ * 3. 调用 write_master_bin_ops_loop() 执行所有操作
+ * 4. 根据请求来源构造不同格式的响应：
+ *    - 批处理请求：直接添加到批处理结果
+ *    - 普通请求：构造完整的响应消息
+ * 5. 清理临时分配的资源
+ *
+ * 内存管理：
+ * - 使用栈分配的数组优化小规模操作
+ * - 大量操作时动态分配内存
+ * - 使用链式缓冲区管理临时粒子数据
+ * - 确保所有分配的资源都能正确释放
+ *
+ * 错误处理：
+ * - 操作失败时返回相应的错误码
+ * - 确保部分成功的操作能够正确回滚
+ * - 提供详细的错误信息用于调试
+ */
 static int
 write_master_bin_ops(as_transaction* tr, as_storage_rd* rd,
 		cf_ll_buf* particles_llb, cf_dyn_buf* db)

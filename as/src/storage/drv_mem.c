@@ -2313,7 +2313,11 @@ sanity_check_flat(const drv_mem* mem, const as_record* r,
 // Local helpers - write record.
 //
 
-// Not static - called by split function.
+/*
+ * Memory 引擎写记录：选定设备（按 key digest）-> write_bins 将 rd 打包写入当前 mwb；
+ * 若是覆盖写，成功后释放旧 record 占用的 block。
+ * Not static - called by split function.
+ */
 int
 write_record(as_storage_rd* rd)
 {
@@ -2332,6 +2336,7 @@ write_record(as_storage_rd* rd)
 
 	drv_mems* mems = (drv_mems*)rd->ns->storage_private;
 
+	// 按 key digest 选择写入的设备（多设备时均衡分布）；覆盖写时可能与旧设备不同。
 	// Figure out which device to write to. When replacing an old record, it's
 	// possible this is different from the old device (e.g. if we've added a
 	// fresh device), so derive it from the digest each time.
@@ -2348,7 +2353,13 @@ write_record(as_storage_rd* rd)
 	return rv;
 }
 
-// Not static - called by split function.
+/*
+ * 将 as_storage_rd 中的记录写入当前 mem 写块 (mwb)：
+ * 1) 计算 flat 大小与限制；2) 若当前 mwb 空间不足则入队并取新 mwb；
+ * 3) 在 mwb 中预留 write_sz 并递增 pos；4) 将 rd 打包成 as_flat_record 写入 mwb->base_addr[pos]；
+ * 5) 写 end_mark；6) 若需副本则做 pickle；7) 更新 r->file_id/rblock_id/n_rblocks 及 namespace 统计。
+ * Not static - called by split function.
+ */
 int
 buffer_bins(as_storage_rd* rd)
 {
@@ -2359,6 +2370,7 @@ buffer_bins(as_storage_rd* rd)
 	uint32_t flat_sz;
 	uint32_t limit_sz;
 
+	// 无 pickle 时按 rd 的 bins 计算 flat 大小；有 pickle 时用已有 pickle 大小（如副本写）。
 	if (rd->pickle == NULL) {
 		flat_sz = as_flat_record_size(rd);
 		limit_sz = ns->max_record_size == 0 ? WBLOCK_SZ : ns->max_record_size;
@@ -2455,6 +2467,7 @@ buffer_bins(as_storage_rd* rd)
 		}
 	}
 
+	// 在当前 mwb 内预留 [mwb_pos, mwb_pos+write_sz)，并推进 mwb->pos 供后续写入。
 	// There's enough space - save the position where this record will be
 	// written, and advance mwb->pos for the next writer.
 
@@ -2467,6 +2480,7 @@ buffer_bins(as_storage_rd* rd)
 	cf_mutex_unlock(&cur_mwb->lock);
 	// May now write this record concurrently with others in this mwb.
 
+	// 将记录扁平化到写块：无预打包则 as_flat_pack_record(rd) 写入 flat_in_mwb，否则 memcpy pickle。
 	// Flatten data into the block.
 
 	uint32_t n_rblocks = ROUNDED_SIZE_TO_N_RBLOCKS(write_sz);
@@ -2486,6 +2500,7 @@ buffer_bins(as_storage_rd* rd)
 
 	drv_add_end_mark((uint8_t*)flat_in_mwb + flat_sz, flat_in_mwb);
 
+	// 若需发副本，将刚写入的 flat 复制为 rd->pickle 供 fabric 发送。
 	// Make a pickle if needed.
 	if (rd->keep_pickle) {
 		rd->pickle_sz = flat_sz;
@@ -2497,6 +2512,7 @@ buffer_bins(as_storage_rd* rd)
 		}
 	}
 
+	// 更新索引中的存储位置：file_id、rblock_id、n_rblocks，便于后续读/覆盖时定位。
 	uint64_t write_offset = WBLOCK_ID_TO_OFFSET(mwb->wblock_id) + mwb_pos;
 
 	r->file_id = mem->file_id;

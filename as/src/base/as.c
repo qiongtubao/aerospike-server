@@ -1,15 +1,26 @@
 /*
- * as.c
+ * as.c - Aerospike 服务器主启动模块
+ *
+ * 模块职责：
+ * 1. 服务器程序主入口点 (as_run)
+ * 2. 命令行参数解析与配置文件加载
+ * 3. 系统初始化：日志、线程、网络、权限分离
+ * 4. 子系统启动顺序控制：
+ *    - 配置阶段：解析配置、设置权限、验证目录
+ *    - 初始化阶段：各子系统初始化但不启动通信
+ *    - 存储阶段：命名空间设置、存储初始化/加载/激活
+ *    - 服务阶段：启动网络监听、集群通信、客户端服务
+ * 5. 主线程阻塞等待与优雅关机控制
+ *
+ * 启动顺序概览：
+ * 命令行解析 -> 基础初始化 -> 配置加载 -> 权限分离 -> 日志激活 ->
+ * 守护进程化 -> 目录验证 -> 子系统初始化 -> 存储系统 -> 服务启动 ->
+ * 主线程阻塞 -> 信号触发关机 -> 优雅关机流程
  *
  * Copyright (C) 2008-2023 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
- *
- * This program is free software: you can redistribute it and/or modify it under
- * the terms of the GNU Affero General Public License as published by the Free
- * Software Foundation, either version 3 of the License, or (at your option) any
- * later version.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
@@ -194,24 +205,66 @@ static void validate_smd_directory(void);
 
 
 //==========================================================
-// Public API - Aerospike server entry point.
+// Public API - Aerospike 服务器程序主入口点
+//
+// 功能描述：
+// Aerospike 服务器的主函数，负责完整的启动流程控制：
+// 1. 解析命令行参数（配置文件路径、前台运行等选项）
+// 2. 基础系统初始化（日志、内存分配器、线程、信号处理）
+// 3. 加载并解析配置文件，创建全局配置对象
+// 4. NUMA 拓扑检测与 CPU/内存绑定准备
+// 5. 权限分离（切换到配置的用户/组）
+// 6. 日志系统激活与守护进程化
+// 7. 目录验证（工作目录、Lua 目录、SMD 目录）
+// 8. 各子系统初始化（但不启动网络通信）
+// 9. 命名空间设置与存储系统初始化/加载/激活
+// 10. 服务启动（网络监听、集群通信、客户端服务）
+// 11. 主线程阻塞等待关机信号
+// 12. 优雅关机流程
+//
+// 参数说明：
+// @argc: 命令行参数个数
+// @argv: 命令行参数数组
+//
+// 返回值：
+// @return: 0 表示正常退出，1 表示错误退出
+//
+// 关键步骤：
+// - 命令行解析阶段：处理 --help、--version、--config-file 等选项
+// - 配置加载阶段：解析配置文件并创建全局配置实例
+// - 权限分离阶段：切换到非 root 用户/组（如果配置了）
+// - 初始化阶段：各子系统初始化但不开始通信
+// - 存储加载阶段：可能会阻塞数小时（冷启动时的磁盘扫描）
+// - 服务启动阶段：开始接受客户端连接和集群通信
+// - 主线程阻塞：通过互斥锁死锁方式等待关机信号
 //
 
+/**
+ * Aerospike 服务器主入口函数
+ *
+ * 执行完整的服务器启动流程，从命令行解析到服务就绪。
+ * 启动完成后主线程会阻塞等待关机信号。
+ */
 int
 as_run(int argc, char **argv)
 {
+	// 记录服务器启动时间戳（用于统计启动耗时）
 	g_start_sec = cf_get_seconds();
 
+	// 命令行选项解析变量初始化
 	int opt;
 	int opt_i;
-	const char *config_file = DEFAULT_CONFIG_FILE;
-	bool run_in_foreground = false;
-	bool new_style_daemon = false;
-	bool early_verbose = false;
-	bool cold_start_cmd = false;
-	uint32_t instance = 0;
+	const char *config_file = DEFAULT_CONFIG_FILE;  // 默认配置文件路径
+	bool run_in_foreground = false;                 // 是否前台运行（不守护进程化）
+	bool new_style_daemon = false;                  // 是否为新式守护进程（systemd/Docker 兼容）
+	bool early_verbose = false;                     // 是否在配置解析前启用详细日志
+	bool cold_start_cmd = false;                    // 是否强制冷启动（企业版功能）
+	uint32_t instance = 0;                          // 实例编号（多实例部署时使用）
 
-	// Parse command line options.
+	//------------------------------------------------------
+	// 第一阶段：命令行参数解析
+	// 处理帮助信息、版本信息、配置文件路径等选项
+	//------------------------------------------------------
 	while ((opt = getopt_long(argc, argv, "", CMD_OPTS, &opt_i)) != -1) {
 		switch (opt) {
 		case 'h':
@@ -258,48 +311,82 @@ as_run(int argc, char **argv)
 		}
 	}
 
-	// Initializations before config parsing.
+	//------------------------------------------------------
+	// 第二阶段：基础系统初始化
+	// 在配置解析之前进行的基本系统组件初始化
+	//------------------------------------------------------
+
+	// 初始化日志系统（早期阶段，根据 early_verbose 设置输出级别）
 	cf_log_init(early_verbose);
+
+	// 初始化内存分配器（cf_malloc/cf_free 等函数的底层实现）
 	cf_alloc_init();
+
+	// 初始化调试跟踪系统
 	cf_trace_init();
+
+	// 初始化线程管理系统（线程创建、销毁、同步原语等）
 	cf_thread_init();
+
+	// 设置信号处理器（SIGTERM、SIGINT 等用于优雅关机）
 	as_signal_setup();
+
+	// 初始化 FIPS 加密模块（如果启用）
 	cf_fips_init();
+
+	// 初始化 TLS/SSL 系统
 	cf_tls_init();
 
-	// Set all fields in the global runtime configuration instance. This parses
-	// the configuration file, and creates as_namespace objects. (Return value
-	// is a shortcut pointer to the global runtime configuration instance.)
+	//------------------------------------------------------
+	// 第三阶段：配置文件解析与全局配置初始化
+	// 解析配置文件，创建全局配置对象，构建命名空间结构
+	//------------------------------------------------------
+
+	// 设置全局运行时配置实例的所有字段
+	// 这会解析配置文件并创建 as_namespace 对象
+	// 返回值是全局运行时配置实例的快捷指针
 	as_config *c = as_config_init(config_file);
 
-	// Detect NUMA topology and, if requested, prepare for CPU and NUMA pinning.
+	//------------------------------------------------------
+	// 第四阶段：NUMA 拓扑检测与 CPU 绑定准备
+	//------------------------------------------------------
+
+	// 检测 NUMA 拓扑结构，如果请求了 CPU 和 NUMA 绑定则进行准备
+	// auto_pin: 自动绑定策略，instance: 实例编号，bind: 服务绑定配置
 	cf_topo_config(c->auto_pin, (cf_topo_numa_node_index)instance,
 			&c->service.bind);
 
-	// Perform privilege separation as necessary. If configured user & group
-	// don't have root privileges, all resources created or reopened past this
-	// point must be set up so that they are accessible without root privileges.
-	// If not, the process will self-terminate with (hopefully!) a log message
-	// indicating which resource is not set up properly.
+	//------------------------------------------------------
+	// 第五阶段：权限分离
+	// 如果配置了非 root 用户/组，则切换权限
+	// 重要：此后创建的所有资源必须确保非 root 用户可访问
+	//------------------------------------------------------
 	cf_process_privsep(c->uid, c->gid);
 
 	//
-	// All resources such as files, devices, and shared memory must be created
-	// or reopened below this line! (The configuration file is the only thing
-	// that must be opened above, in order to parse the user & group.)
+	// 权限分离临界点：此行以下的所有资源（文件、设备、共享内存）
+	// 都必须重新创建或重新打开！（配置文件是唯一例外，必须在上面打开以解析用户和组）
 	//==========================================================================
 
-	// Activate log sinks. Up to this point, 'cf_' log output goes to stderr,
-	// filtered according to early_verbose. After this point, 'cf_' log output
-	// will appear in all log file sinks specified in configuration, with
-	// specified filtering. If console sink is specified in configuration, 'cf_'
-	// log output will continue going to stderr, but filtering will switch to
-	// that specified in console sink configuration.
+	//------------------------------------------------------
+	// 第六阶段：日志系统激活
+	// 激活配置文件中指定的所有日志接收器
+	//------------------------------------------------------
+
+	// 激活日志接收器
+	// 在此之前，'cf_' 日志输出到 stderr，根据 early_verbose 过滤
+	// 在此之后，'cf_' 日志输出将出现在配置中指定的所有日志文件中，
+	// 使用指定的过滤规则。如果配置中指定了控制台接收器，
+	// 'cf_' 日志输出将继续发送到 stderr，但过滤规则切换为控制台配置
 	cf_log_activate_sinks();
 
-	// Daemonize asd if specified. After daemonization, output to stderr will no
-	// longer appear in terminal. Instead, check /tmp/aerospike-console.<pid>
-	// for console output.
+	//------------------------------------------------------
+	// 第七阶段：守护进程化（如果需要）
+	//------------------------------------------------------
+
+	// 如果指定了守护进程化，则执行
+	// 守护进程化后，stderr 输出将不再出现在终端中
+	// 而是检查 /tmp/aerospike-console.<pid> 获取控制台输出
 	if (! run_in_foreground && c->run_as_daemon) {
 		cf_process_daemonize();
 	}
@@ -326,139 +413,191 @@ as_run(int argc, char **argv)
 		}
 	}
 
-	// Check that required directories are set up properly.
-	validate_directory(c->work_directory, "work");
-	validate_directory(c->mod_lua.user_path, "Lua user");
-	validate_smd_directory();
+	//------------------------------------------------------
+	// 第八阶段：目录验证
+	// 检查必需的目录是否正确设置
+	//------------------------------------------------------
 
-	// Initialize subsystems. At this point we're allocating local resources,
-	// starting worker threads, etc. (But no communication with other server
-	// nodes or clients yet.)
+	// 检查必需的目录是否正确设置
+	validate_directory(c->work_directory, "work");        // 工作目录
+	validate_directory(c->mod_lua.user_path, "Lua user"); // Lua 用户脚本目录
+	validate_smd_directory();                             // 系统元数据目录
 
-	as_json_init();				// Jansson JSON API used by System Metadata
-	as_index_tree_gc_init();	// thread to purge dropped index trees
-	as_nsup_init();				// load previous evict-void-time(s)
-	as_xdr_init();				// load persisted last-ship-time(s)
-	as_roster_init();			// load roster-related SMD
+	//------------------------------------------------------
+	// 第九阶段：子系统初始化
+	// 在此阶段分配本地资源、启动工作线程等
+	// 但尚未与其他服务器节点或客户端进行通信
+	//------------------------------------------------------
 
-	// Set up namespaces. Each namespace decides here whether it will do a warm
-	// or cold start. Index arenas, set and bin name vmaps are initialized.
+	// 初始化 Jansson JSON API（系统元数据使用）
+	as_json_init();
+
+	// 初始化索引树垃圾收集线程（清理被丢弃的索引树）
+	as_index_tree_gc_init();
+
+	// 初始化命名空间清理系统（加载之前的驱逐空闲时间）
+	as_nsup_init();
+
+	// 初始化 XDR 系统（加载持久化的最后发送时间）
+	as_xdr_init();
+
+	// 初始化集群名单系统（加载名单相关的 SMD）
+	as_roster_init();
+
+	//------------------------------------------------------
+	// 第十阶段：命名空间设置
+	// 每个命名空间在此决定是否进行热启动或冷启动
+	// 初始化索引区域、集合和字段名称映射
+	//------------------------------------------------------
+
+	// 设置命名空间
+	// 每个命名空间在此决定是否进行热启动或冷启动
+	// 索引区域、集合和字段名映射被初始化
 	as_namespaces_setup(cold_start_cmd, instance);
 
-	// These load SMD involving sets/bins, needed during storage init/load.
-	as_sindex_init();
-	as_truncate_init();
+	// 加载涉及集合/字段的 SMD（存储初始化/加载期间需要）
+	as_sindex_init();    // 二级索引初始化
+	as_truncate_init();  // 截断操作初始化
 
-	// Initialize namespaces. Partition structures and index tree structures are
-	// initialized.
+	// 初始化命名空间
+	// 分区结构和索引树结构被初始化
 	as_namespaces_init(cold_start_cmd, instance);
 
-	// Initialize the storage system. For warm restarts, this includes fully
-	// resuming persisted indexes.
+	//------------------------------------------------------
+	// 第十一阶段：存储系统初始化
+	// 对于热重启，包括完全恢复持久化的索引
+	// 注意：此阶段可能阻塞数分钟
+	//------------------------------------------------------
+
+	// 初始化存储系统
+	// 对于热重启，这包括完全恢复持久化的索引
 	as_storage_init();
-	// ... This could block for minutes ....................
+	// ... 此处可能阻塞数分钟 .....................
 
-	// For warm restarts, fully resume persisted sindexes.
+	// 对于热重启，完全恢复持久化的二级索引
 	as_sindex_resume();
-	// ... This could block for minutes ....................
+	// ... 此处可能阻塞数分钟 .....................
 
-	// Migrate memory to correct NUMA node (includes resumed index arenas).
+	//------------------------------------------------------
+	// 第十二阶段：内存迁移与权限清理
+	//------------------------------------------------------
+
+	// 将内存迁移到正确的 NUMA 节点（包括恢复的索引区域）
 	cf_topo_migrate_memory();
 
-	// Drop capabilities that we kept only for initialization.
+	// 丢弃只在初始化时保留的权限
 	cf_process_drop_startup_caps();
 
-	// For cold starts, this does full drive scans. (Also populates
-	// storage-engine memory & pmem namespaces' secondary indexes.)
+	//------------------------------------------------------
+	// 第十三阶段：存储系统加载
+	// 对于冷启动，执行完整的磁盘扫描
+	// 同时填充存储引擎内存和 pmem 命名空间的二级索引
+	// 注意：此阶段可能阻塞数小时
+	//------------------------------------------------------
+
+	// 对于冷启动，这会执行完整的磁盘扫描
+	// （同时填充存储引擎内存和 pmem 命名空间的二级索引）
 	as_storage_load();
-	// ... This could block for hours ......................
+	// ... 此处可能阻塞数小时 ......................
 
-	// Populate storage-engine device namespaces' secondary indexes.
+	// 填充存储引擎设备命名空间的二级索引
 	as_sindex_load();
-	// ... This could block for a while ....................
+	// ... 此处可能阻塞一段时间 ....................
 
-	// The defrag subsystem starts operating here. Wait for enough available
-	// storage.
+	//------------------------------------------------------
+	// 第十四阶段：存储系统激活
+	// 碎片整理子系统开始运行，等待足够的可用存储
+	//------------------------------------------------------
+
+	// 碎片整理子系统在此开始运行
+	// 等待足够的可用存储
 	as_storage_activate();
-	// ... This could block for a while ....................
+	// ... 此处可能阻塞一段时间 ....................
 
 	cf_info(AS_AS, "initializing services...");
 
-	cf_dns_init();				// DNS resolver
-	as_security_init();			// security features
-	as_service_init();			// server may process internal transactions
-	as_hb_init();				// inter-node heartbeat
-	as_skew_monitor_init();		// clock skew monitor
-	as_fabric_init();			// inter-node communications
-	as_exchange_init();			// initialize the cluster exchange subsystem
-	as_clustering_init();		// clustering-v5 start
-	as_service_list_init();		// service list handling
-	as_info_init();				// info transaction handling
-	as_migrate_init();			// move data between nodes
-	as_proxy_init();			// do work on behalf of others
-	as_rw_init();				// read & write service
-	as_query_manager_init();	// query transaction handling
-	as_udf_init();				// user-defined functions
-	as_batch_init();			// batch transaction handling
-	as_set_index_init();		// dynamic set-index population
+	//------------------------------------------------------
+	// 第十五阶段：各子服务系统初始化
+	// 初始化各个服务组件，但尚未开始网络通信
+	//------------------------------------------------------
 
-	// Start subsystems. At this point we may begin communicating with other
-	// cluster nodes, and ultimately with clients.
+	cf_dns_init();				// DNS 解析器初始化
+	as_security_init();			// 安全功能初始化
+	as_service_init();			// 创建 service 线程池（每个线程运行 run_service），此时尚未监听端口
+	as_hb_init();				// 节点间心跳初始化
+	as_skew_monitor_init();		// 时钟偏差监控器初始化
+	as_fabric_init();			// 节点间通信初始化
+	as_exchange_init();			// 集群交换子系统初始化
+	as_clustering_init();		// 集群管理 v5 初始化
+	as_service_list_init();		// 服务列表处理初始化
+	as_info_init();				// 信息事务处理初始化
+	as_migrate_init();			// 数据迁移初始化
+	as_proxy_init();			// 代理服务初始化（代表其他节点执行工作）
+	as_rw_init();				// 读写服务初始化
+	as_query_manager_init();	// 查询事务处理初始化
+	as_udf_init();				// 用户自定义函数初始化
+	as_batch_init();			// 批处理事务处理初始化
+	as_set_index_init();		// 动态集合索引填充初始化
 
-	cf_tls_start();				// starts tls certificate refresh thread
-	as_sindex_start();			// starts sindex GC threads
-	as_smd_start();				// enables receiving cluster state change events
-	as_health_start();			// starts before fabric and hb to capture them
-	as_fabric_start();			// may send & receive fabric messages
-	as_xdr_start();				// XDR should start before it joins other nodes
-	as_hb_start();				// start inter-node heartbeat
-	as_exchange_start();		// start the cluster exchange subsystem
-	as_clustering_start();		// clustering-v5 start
-	as_nsup_start();			// may send evict-void-time(s) to other nodes
-	as_service_start();			// server will now receive client transactions
-	as_info_port_start();		// server will now receive info transactions
-	as_ticker_start();			// only after everything else is started
+	//------------------------------------------------------
+	// 第十六阶段：启动子系统
+	// 在此阶段开始与其他集群节点通信，最终与客户端通信
+	//------------------------------------------------------
 
-	// Relevant for enterprise edition only.
+	cf_tls_start();				// 启动 TLS 证书刷新线程
+	as_sindex_start();			// 启动二级索引垃圾收集线程
+	as_smd_start();				// 启用接收集群状态变更事件
+	as_health_start();			// 在 fabric 和 hb 之前启动以捕获它们的状态
+	as_fabric_start();			// 可以发送和接收 fabric 消息
+	as_xdr_start();				// XDR 应该在加入其他节点之前启动
+	as_hb_start();				// 启动节点间心跳
+	as_exchange_start();		// 启动集群交换子系统
+	as_clustering_start();		// 集群管理 v5 启动
+	as_nsup_start();			// 可能向其他节点发送驱逐空闲时间
+	as_service_start();			// 监听端口、启动 reaper，开始接收客户端连接与事务
+	as_info_port_start();		// 服务器现在接收信息事务
+	as_ticker_start();			// 只在所有其他组件启动后启动
+
+	// 企业版相关功能启动
 	as_storage_start_tomb_raider();
 
-	// Log a service-ready message.
+	// 记录服务就绪消息
 	cf_info(AS_AS, "service ready: soon there will be cake!");
 
-	//--------------------------------------------
-	// Startup is done. This thread will now wait
-	// quietly for a shutdown signal.
-	//
+	//------------------------------------------------------
+	// 第十七阶段：启动完成，主线程阻塞等待
+	// 主线程将静静等待关机信号
+	//------------------------------------------------------
 
-	// Stop this thread from finishing. Intentionally deadlocking on a mutex is
-	// a remarkably efficient way to do this.
+	// 通过故意死锁在互斥锁上来阻止此线程结束
+	// 这是一种非常高效的方式来实现主线程阻塞
 	pthread_mutex_lock(&g_main_deadlock);
-	g_startup_complete = true;
-	pthread_mutex_lock(&g_main_deadlock);
+	g_startup_complete = true;                    // 标记启动完成
+	pthread_mutex_lock(&g_main_deadlock);        // 第二次锁定导致死锁
 
-	// When the service is running, you are here (deadlocked) - the signals that
-	// stop the service (yes, these signals always occur in this thread) will
-	// unlock the mutex, allowing us to continue.
+	// 当服务运行时，你在这里（死锁状态）
+	// 停止服务的信号（是的，这些信号总是在这个线程中发生）
+	// 将解锁互斥锁，允许我们继续执行
 
-	g_shutdown_started = true;
+	g_shutdown_started = true;                    // 标记关机开始
 	pthread_mutex_unlock(&g_main_deadlock);
 	pthread_mutex_destroy(&g_main_deadlock);
 
-	//--------------------------------------------
-	// Received a shutdown signal.
-	//
+	//------------------------------------------------------
+	// 第十八阶段：优雅关机流程
+	// 收到关机信号后的清理工作
+	//------------------------------------------------------
 
 	cf_info(AS_AS, "initiating clean shutdown ...");
 
-	// If this node was not quiesced and storage shutdown takes very long (e.g.
-	// flushing pmem index), best to get kicked out of the cluster quickly.
+	// 如果此节点未被静默且存储关机需要很长时间（例如刷新 pmem 索引），
+	// 最好快速退出集群
 	as_hb_shutdown();
 
-	// Block partition rebalance to prevent new (non-null) partition trees from
-	// being swizzled in.
+	// 阻止分区重新平衡，防止新的（非空）分区树被交换进来
 	as_exchange_shutdown();
 
-	// Make sure committed SMD files are in sync with SMD callback activity.
+	// 确保已提交的 SMD 文件与 SMD 回调活动同步
 	as_smd_shutdown();
 
 	if (! as_storage_shutdown(instance)) {
@@ -481,21 +620,38 @@ as_run(int argc, char **argv)
 
 
 //==========================================================
-// Local helpers.
+// 本地辅助函数
 //
 
+/**
+ * 写入 PID 文件
+ *
+ * 功能描述：
+ * 将当前进程的 PID 写入指定的 PID 文件中，用于进程管理和监控。
+ * 如果写入失败，会记录警告但不会终止进程。
+ *
+ * 参数说明：
+ * @pidfile: PID 文件路径，如果为 NULL 则跳过写入
+ *
+ * 注意事项：
+ * - PID 文件所在的目录必须已经存在
+ * - 如果文件已存在会先删除再创建
+ * - 写入失败不会导致进程崩溃，只记录警告
+ */
 static void
 write_pidfile(char *pidfile)
 {
 	if (pidfile == NULL) {
-		// If there's no pid file specified in the config file, just move on.
+		// 如果配置文件中没有指定 PID 文件，则跳过
 		return;
 	}
 
-	// Note - the directory the pid file is in must already exist.
+	// 注意：PID 文件所在的目录必须已经存在
 
+	// 先删除现有的 PID 文件（如果存在）
 	remove(pidfile);
 
+	// 以读写模式创建 PID 文件，使用系统日志权限
 	int pid_fd = open(pidfile, O_CREAT | O_RDWR, cf_os_log_perms());
 
 	if (pid_fd < 0) {
@@ -503,11 +659,12 @@ write_pidfile(char *pidfile)
 				cf_strerror(errno));
 	}
 
+	// 格式化当前进程 PID 为字符串
 	char pidstr[16];
 	sprintf(pidstr, "%u\n", (uint32_t)getpid());
 
-	// If we can't access this resource, just log a warning and continue -
-	// it is not critical to the process.
+	// 写入 PID 到文件
+	// 如果无法访问此资源，只记录警告并继续 - 这对进程不是关键的
 	if (write(pid_fd, pidstr, strlen(pidstr)) == -1) {
 		cf_warning(AS_AS, "failed write to pid file %s: %s", pidfile,
 				cf_strerror(errno));
@@ -516,28 +673,61 @@ write_pidfile(char *pidfile)
 	close(pid_fd);
 }
 
+/**
+ * 验证目录是否正确设置
+ *
+ * 功能描述：
+ * 检查指定路径是否存在且为目录。如果检查失败，进程会崩溃退出。
+ *
+ * 参数说明：
+ * @path: 要验证的目录路径
+ * @log_tag: 用于日志记录的目录类型标识（如 "work"、"Lua user"）
+ *
+ * 错误处理：
+ * 如果目录不存在或不是目录，程序会立即崩溃退出
+ */
 static void
 validate_directory(const char *path, const char *log_tag)
 {
 	struct stat buf;
 
+	// 检查路径是否存在并获取其状态信息
 	if (stat(path, &buf) != 0) {
 		cf_crash_nostack(AS_AS, "%s directory '%s' is not set up properly: %s",
 				log_tag, path, cf_strerror(errno));
 	}
+	// 检查路径是否为目录
 	else if (! S_ISDIR(buf.st_mode)) {
 		cf_crash_nostack(AS_AS, "%s directory '%s' is not set up properly: Not a directory",
 				log_tag, path);
 	}
 }
 
+/**
+ * 验证系统元数据目录
+ *
+ * 功能描述：
+ * 验证系统元数据 (SMD) 目录是否正确设置。
+ * SMD 目录位于工作目录下的 "/smd" 子目录中。
+ *
+ * 实现逻辑：
+ * 1. 构造 SMD 目录的完整路径（工作目录 + "/smd"）
+ * 2. 调用 validate_directory 进行验证
+ *
+ * 错误处理：
+ * 如果 SMD 目录不存在或设置不正确，程序会崩溃退出
+ */
 static void
 validate_smd_directory(void)
 {
+	// 计算 SMD 目录路径所需的缓冲区大小
 	size_t len = strlen(g_config.work_directory);
 	char smd_path[len + sizeof(SMD_DIR_NAME)];
 
+	// 构造完整的 SMD 目录路径：工作目录 + "/smd"
 	strcpy(smd_path, g_config.work_directory);
 	strcpy(smd_path + len, SMD_DIR_NAME);
+
+	// 验证 SMD 目录是否正确设置
 	validate_directory(smd_path, "system metadata");
 }

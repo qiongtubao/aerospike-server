@@ -1,5 +1,20 @@
 /*
- * drv_ssd.c
+ * drv_ssd.c - Aerospike SSD存储驱动核心实现
+ *
+ * 本文件是Aerospike数据库最重要的存储驱动实现，负责：
+ * 1. SSD设备的初始化、管理和监控
+ * 2. 记录的读取、写入和删除操作
+ * 3. 写缓冲区(Write Buffer)管理
+ * 4. 后台碎片整理(Defragmentation)
+ * 5. 设备健康状态监控和故障处理
+ * 6. 持久化存储的数据完整性保障
+ *
+ * 主要组件：
+ * - 文件描述符池管理：复用fd减少系统调用开销
+ * - 写块(wblock)状态管理：跟踪块的使用状态
+ * - 写缓冲区(swb)机制：批量写入提高性能
+ * - 碎片整理引擎：回收空间，提高存储效率
+ * - 设备监控：检测设备健康状态和性能
  *
  * Copyright (C) 2009-2023 Aerospike, Inc.
  *
@@ -74,45 +89,63 @@
 
 
 //==========================================================
-// Constants.
+// 常量定义
 //
 
-// TODO - could decrease this as number of drives increases?
-#define MAX_POOL_FDS 512 // power of 2 (rounds up anyway)
+// 文件描述符池最大大小 - TODO: 可考虑根据驱动器数量调整
+#define MAX_POOL_FDS 512 // 2的幂(无论如何都会向上取整)
 
+// 原地写入标志
 #define WRITE_IN_PLACE 1
 
 
 //==========================================================
-// Miscellaneous utility functions.
+// 通用工具函数
 //
 
-// Get an open file descriptor from the pool, or a fresh one if necessary.
+/**
+ * 从文件描述符池中获取一个可用的fd，如果池为空则创建新的
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return 可用的文件描述符，失败时会crash程序
+ *
+ * 实现逻辑：
+ * 1. 首先尝试从fd池中弹出一个可用的fd
+ * 2. 如果池为空，检查当前fd数量是否达到上限
+ * 3. 若未达到上限，原子性增加fd计数器并创建新fd
+ * 4. 新创建的fd使用O_DIRECT等标志以优化性能
+ */
 int
 ssd_fd_get(drv_ssd *ssd)
 {
 	while (true) {
+		// 尝试从fd池中获取一个可用的文件描述符
 		int fd = cf_pool_int32_pop(&ssd->fd_pool);
 
 		if (fd != -1) {
-			return fd;
+			return fd; // 成功获取，直接返回
 		}
 
+		// 检查当前已创建的fd数量
 		uint32_t n_fds = as_load_uint32(&ssd->n_fds);
 
 		if (n_fds == MAX_POOL_FDS) {
+			// fd池已满，记录警告并让出CPU时间片
 			cf_ticker_warning(AS_DRV_SSD, "%s: fd pool full", ssd->name);
 			sched_yield();
 			continue;
 		}
 
+		// 尝试原子性地增加fd计数
 		if (! as_cas_uint32(&ssd->n_fds, n_fds, n_fds + 1)) {
-			continue;
+			continue; // CAS失败，重试
 		}
 
+		// 创建新的文件描述符
 		fd = open(ssd->name, ssd->open_flag, cf_os_base_perms());
 
 		if (fd < 0) {
+			// 设备打开失败，这是致命错误
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->name, errno, cf_strerror(errno));
 		}
@@ -121,33 +154,46 @@ ssd_fd_get(drv_ssd *ssd)
 	}
 }
 
-
+/**
+ * 获取用于缓存操作的文件描述符
+ * 与ssd_fd_get类似，但创建的fd不使用O_DIRECT和O_DSYNC标志
+ * 主要用于不需要绕过操作系统缓存的读操作
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return 可用的缓存文件描述符
+ */
 int
 ssd_fd_cache_get(drv_ssd *ssd)
 {
 	while (true) {
+		// 尝试从缓存fd池中获取一个可用的文件描述符
 		int fd = cf_pool_int32_pop(&ssd->fd_cache_pool);
 
 		if (fd != -1) {
-			return fd;
+			return fd; // 成功获取，直接返回
 		}
 
+		// 检查当前已创建的缓存fd数量
 		uint32_t n_fds = as_load_uint32(&ssd->n_cache_fds);
 
 		if (n_fds == MAX_POOL_FDS) {
+			// 缓存fd池已满，记录警告并让出CPU时间片
 			cf_ticker_warning(AS_DRV_SSD, "%s: cache fd pool full", ssd->name);
 			sched_yield();
 			continue;
 		}
 
+		// 尝试原子性地增加缓存fd计数
 		if (! as_cas_uint32(&ssd->n_cache_fds, n_fds, n_fds + 1)) {
-			continue;
+			continue; // CAS失败，重试
 		}
 
+		// 创建新的缓存文件描述符(移除O_DIRECT和O_DSYNC标志)
 		fd = open(ssd->name, ssd->open_flag & ~(O_DIRECT | O_DSYNC),
 				cf_os_base_perms());
 
 		if (fd < 0) {
+			// 设备打开失败，这是致命错误
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->name, errno, cf_strerror(errno));
 		}
@@ -157,16 +203,26 @@ ssd_fd_cache_get(drv_ssd *ssd)
 }
 
 
+/**
+ * 获取shadow设备的文件描述符
+ * Shadow设备用于数据备份或镜像操作
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return shadow设备的文件描述符
+ */
 int
 ssd_shadow_fd_get(drv_ssd *ssd)
 {
 	int fd = -1;
+	// 尝试从shadow fd队列中获取一个可用的fd
 	int rv = cf_queue_pop(ssd->shadow_fd_q, (void*)&fd, CF_QUEUE_NOWAIT);
 
 	if (rv != CF_QUEUE_OK) {
+		// 队列为空，创建新的shadow设备fd
 		fd = open(ssd->shadow_name, ssd->open_flag, cf_os_base_perms());
 
 		if (fd < 0) {
+			// Shadow设备打开失败，这是致命错误
 			cf_crash(AS_DRV_SSD, "%s: DEVICE FAILED open: errno %d (%s)",
 					ssd->shadow_name, errno, cf_strerror(errno));
 		}
@@ -176,7 +232,13 @@ ssd_shadow_fd_get(drv_ssd *ssd)
 }
 
 
-// Save an open file descriptor in the pool
+/**
+ * 将文件描述符归还到普通fd池中以供重用
+ * 避免频繁创建和关闭fd的开销
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param fd 要归还的文件描述符
+ */
 void
 ssd_fd_put(drv_ssd *ssd, int fd)
 {
@@ -184,6 +246,12 @@ ssd_fd_put(drv_ssd *ssd, int fd)
 }
 
 
+/**
+ * 将文件描述符归还到缓存fd池中以供重用
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param fd 要归还的文件描述符
+ */
 static inline void
 ssd_fd_cache_put(drv_ssd *ssd, int fd)
 {
@@ -191,6 +259,12 @@ ssd_fd_cache_put(drv_ssd *ssd, int fd)
 }
 
 
+/**
+ * 将shadow设备的文件描述符归还到队列中
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param fd 要归还的文件描述符
+ */
 static inline void
 ssd_shadow_fd_put(drv_ssd *ssd, int fd)
 {
@@ -198,7 +272,14 @@ ssd_shadow_fd_put(drv_ssd *ssd, int fd)
 }
 
 
-// Decide which device a record belongs on.
+/**
+ * 根据记录的key digest确定记录应该存储在哪个设备上
+ * 使用digest的特定字节进行哈希分布，确保记录均匀分布在多个SSD上
+ *
+ * @param ssds SSD驱动器组结构体指针
+ * @param keyd 记录的key digest
+ * @return 目标设备的文件ID
+ */
 static inline uint32_t
 ssd_get_file_id(drv_ssds *ssds, cf_digest *keyd)
 {
@@ -206,20 +287,33 @@ ssd_get_file_id(drv_ssds *ssds, cf_digest *keyd)
 }
 
 
-// Put a wblock on the write queue, to be flushed.
+/**
+ * 将写缓冲区(write block)放入写队列，等待刷写到磁盘
+ * 当写缓冲区满时调用此函数将其加入刷写队列
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param swb 要刷写的写缓冲区指针
+ */
 static inline void
 push_wblock_to_write_q(drv_ssd* ssd, const ssd_write_buf* swb)
 {
+	// 增加待刷写的写块计数
 	as_incr_uint32(&ssd->ns->n_wblocks_to_flush);
 	cf_queue_push(ssd->swb_write_q, &swb);
 }
 
 
-// Put a wblock on the free queue for reuse.
+/**
+ * 将写块放入空闲队列以供重用
+ * 当写块中的所有数据都被删除或迁移后，将其标记为空闲状态
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param wblock_id 写块ID
+ */
 static inline void
 push_wblock_to_free_q(drv_ssd *ssd, uint32_t wblock_id)
 {
-	// Can get here before queue created, e.g. cold start replacing records.
+	// 在冷启动替换记录时，队列可能尚未创建
 	if (ssd->free_wblock_q == NULL) {
 		return;
 	}
@@ -227,16 +321,24 @@ push_wblock_to_free_q(drv_ssd *ssd, uint32_t wblock_id)
 	cf_assert(wblock_id < ssd->n_wblocks, AS_DRV_SSD,
 			"pushing bad wblock_id %d to free_wblock_q", (int32_t)wblock_id);
 
+	// 标记写块状态为空闲
 	ssd->wblock_state[wblock_id].state = WBLOCK_STATE_FREE;
 	cf_queue_push(ssd->free_wblock_q, &wblock_id);
 }
 
 
-// Put a wblock on the defrag queue.
+/**
+ * 将写块放入碎片整理队列
+ * 当写块的使用率低于阈值时，将其加入defrag队列进行空间回收
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param wblock_id 写块ID
+ */
 static inline void
 push_wblock_to_defrag_q(drv_ssd *ssd, uint32_t wblock_id)
 {
-	if (ssd->defrag_wblock_q) { // null until devices are loaded at startup
+	if (ssd->defrag_wblock_q) { // 启动时设备加载前为null
+		// 标记写块状态为碎片整理中
 		ssd->wblock_state[wblock_id].state = WBLOCK_STATE_DEFRAG;
 		cf_queue_push(ssd->defrag_wblock_q, &wblock_id);
 		as_incr_uint64(&ssd->n_defrag_wblock_reads);
@@ -244,22 +346,37 @@ push_wblock_to_defrag_q(drv_ssd *ssd, uint32_t wblock_id)
 }
 
 
+/**
+ * 分配一个全新的(pristine)写块ID
+ * 全新写块是从未被使用过的块，无需进行垃圾回收
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param wblock_id 输出参数，存储分配的写块ID
+ * @return true表示成功分配，false表示空间不足
+ */
 static inline bool
 pop_pristine_wblock_id(drv_ssd *ssd, uint32_t* wblock_id)
 {
 	uint32_t id;
 
 	while ((id = as_load_uint32(&ssd->pristine_wblock_id)) < ssd->n_wblocks) {
+		// 尝试原子性地递增pristine写块ID
 		if (as_cas_uint32(&ssd->pristine_wblock_id, id, id + 1)) {
 			*wblock_id = id;
-			return true;
+			return true; // 成功分配
 		}
 	}
 
-	return false; // out of space
+	return false; // 空间不足
 }
 
 
+/**
+ * 获取剩余的全新写块数量
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return 剩余全新写块数量
+ */
 static inline uint32_t
 num_pristine_wblocks(const drv_ssd *ssd)
 {
@@ -267,6 +384,12 @@ num_pristine_wblocks(const drv_ssd *ssd)
 }
 
 
+/**
+ * 获取空闲写块总数(包括队列中的和全新的)
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return 空闲写块总数
+ */
 static inline uint32_t
 num_free_wblocks(const drv_ssd *ssd)
 {
@@ -274,18 +397,32 @@ num_free_wblocks(const drv_ssd *ssd)
 }
 
 
-// Available contiguous size.
+/**
+ * 计算可用的连续存储空间大小
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @return 可用空间大小(字节)
+ *
+ * 注意：在冷启动期间返回100%可用空间，使其在冷启动驱逐阈值检查中无关紧要
+ */
 static inline uint64_t
 available_size(drv_ssd *ssd)
 {
-	// Note - returns 100% available during cold start, to make it irrelevant in
-	// cold start eviction threshold check.
-
 	return ssd->free_wblock_q != NULL ?
 			(uint64_t)num_free_wblocks(ssd) * WBLOCK_SZ : ssd->file_size;
 }
 
 
+/**
+ * 释放已清空的写块
+ *
+ * 此函数用于在碎片整理过程中释放已经被清空的写块。当一个写块的所有有效数据
+ * 都被迁移到其他位置后，该写块就可以被标记为空闲状态，以便后续重用。
+ *
+ * @param ssd 指向 SSD 驱动器结构的指针
+ * @param wblock_id 要释放的写块 ID
+ * @param p_wblock_state 指向写块状态结构的指针
+ */
 void
 ssd_release_vacated_wblock(drv_ssd *ssd, uint32_t wblock_id,
 		ssd_wblock_state* p_wblock_state)
@@ -330,6 +467,15 @@ ssd_release_vacated_wblock(drv_ssd *ssd, uint32_t wblock_id,
 
 #define VACATED_CAPACITY_STEP 128 // allocate in 1K chunks
 
+/**
+ * 创建一个新的写缓冲区 (SSD Write Buffer)
+ *
+ * 分配并初始化一个新的写缓冲区结构，用于暂存即将写入 SSD 的数据。
+ * 写缓冲区包含一个写块大小的内存缓冲区和用于跟踪已清空写块的数组。
+ *
+ * @param ssd 指向 SSD 设备结构的指针
+ * @return 返回新创建的写缓冲区指针
+ */
 static inline ssd_write_buf*
 swb_create(drv_ssd *ssd)
 {
@@ -346,6 +492,14 @@ swb_create(drv_ssd *ssd)
 	return swb;
 }
 
+/**
+ * 销毁写缓冲区
+ *
+ * 释放写缓冲区及其相关的所有内存资源，包括缓冲区内存、
+ * 已清空写块数组和加密缓冲区（如果存在）。
+ *
+ * @param swb 指向要销毁的写缓冲区的指针
+ */
 static inline void
 swb_destroy(ssd_write_buf *swb)
 {
@@ -432,6 +586,21 @@ swb_dereference_and_release(drv_ssd *ssd, ssd_write_buf *swb)
 	cf_mutex_unlock(&wblock_state->LOCK);
 }
 
+/**
+ * 获取一个写缓冲区 (SSD Write Buffer)
+ *
+ * 此函数负责分配或复用一个写缓冲区，用于缓存即将写入存储设备的数据。
+ * 主要功能包括：
+ * 1. 检查是否有足够的空闲写块（考虑碎片整理预留）
+ * 2. 从空闲队列中获取或创建新的写缓冲区
+ * 3. 为缓冲区分配一个空闲的写块 ID
+ * 4. 验证分配的写块处于正确的状态
+ * 5. 将写块状态更新为已预留状态
+ *
+ * @param ssd 指向 SSD 设备结构的指针
+ * @param use_reserve 是否允许使用为碎片整理预留的写块
+ * @return 成功时返回写缓冲区指针，空间不足时返回 NULL
+ */
 ssd_write_buf *
 swb_get(drv_ssd *ssd, bool use_reserve)
 {
@@ -487,6 +656,15 @@ swb_get(drv_ssd *ssd, bool use_reserve)
 	return swb;
 }
 
+/**
+ * 判断写入操作是否需要使用后写队列
+ *
+ * 后写队列用于处理需要额外后续处理的写入操作，如索引更新等。
+ * 此函数根据写入的类型和配置决定是否使用后写队列。
+ *
+ * @param rd 指向存储读取描述符的指针
+ * @return 如果需要使用后写队列返回 true，否则返回 false
+ */
 bool
 write_uses_post_write_q(as_storage_rd *rd)
 {
@@ -542,12 +720,27 @@ swb_release_all_vacated_wblocks(ssd_write_buf* swb)
 //------------------------------------------------
 
 
-// Reduce wblock's used size, if result is 0 put it in the "free" pool, if it's
-// below the defrag threshold put it in the defrag queue.
+/**
+ * 释放写块使用的空间，并根据结果决定写块的后续状态
+ * 如果释放后写块空闲，将其放入空闲池；如果低于碎片整理阈值，放入碎片整理队列
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param rblock_id 记录块ID
+ * @param n_rblocks 记录块数量
+ * @param msg 调试信息标识
+ *
+ * 核心逻辑：
+ * 1. 计算记录的起始偏移、大小和对应的写块ID
+ * 2. 原子性地减少写块的使用空间
+ * 3. 根据释放后的使用量决定写块状态：
+ *    - 为0：放入空闲队列
+ *    - 低于碎片整理阈值：放入碎片整理队列
+ *    - 其他：保持已使用状态
+ */
 void
 ssd_block_free(drv_ssd *ssd, uint64_t rblock_id, uint32_t n_rblocks, char *msg)
 {
-	// Determine which wblock we're reducing used size in.
+	// 确定我们正在减少使用大小的写块
 	uint64_t start_offset = RBLOCK_ID_TO_OFFSET(rblock_id);
 	uint32_t size = N_RBLOCKS_TO_SIZE(n_rblocks);
 	uint32_t wblock_id = OFFSET_TO_WBLOCK_ID(start_offset);
@@ -562,12 +755,14 @@ ssd_block_free(drv_ssd *ssd, uint64_t rblock_id, uint32_t n_rblocks, char *msg)
 			AS_DRV_SSD, "%s: %s: freeing bad range rblock_id %lu n_rblocks %u",
 			ssd->name, msg, rblock_id, n_rblocks);
 
+	// 减少SSD总使用空间
 	as_add_uint64(&ssd->inuse_size, -(int64_t)size);
 
 	ssd_wblock_state *p_wblock_state = &ssd->wblock_state[wblock_id];
 
 	cf_mutex_lock(&p_wblock_state->LOCK);
 
+	// 原子性地减少写块使用空间
 	int64_t resulting_inuse_sz =
 			(int32_t)as_aaf_uint32(&p_wblock_state->inuse_sz, -(int32_t)size);
 
@@ -577,16 +772,20 @@ ssd_block_free(drv_ssd *ssd, uint64_t rblock_id, uint32_t n_rblocks, char *msg)
 			wblock_id, resulting_inuse_sz < 0 ? "over-freed" : "bad inuse_sz",
 			(int32_t)size, resulting_inuse_sz);
 
+	// 根据写块状态和剩余使用空间决定后续操作
 	if (p_wblock_state->state == WBLOCK_STATE_USED) {
 		if (resulting_inuse_sz == 0) {
+			// 写块完全空闲，直接放入空闲队列
 			as_incr_uint64(&ssd->n_wblock_direct_frees);
 			push_wblock_to_free_q(ssd, wblock_id);
 		}
 		else if (resulting_inuse_sz < ssd->ns->defrag_lwm_size) {
+			// 使用率低于阈值，放入碎片整理队列
 			push_wblock_to_defrag_q(ssd, wblock_id);
 		}
 	}
 	else if (p_wblock_state->state == WBLOCK_STATE_EMPTYING) {
+		// 正在清空的写块，如果完全空闲则放入空闲队列
 		if (resulting_inuse_sz == 0) {
 			push_wblock_to_free_q(ssd, wblock_id);
 		}
@@ -596,7 +795,23 @@ ssd_block_free(drv_ssd *ssd, uint64_t rblock_id, uint32_t n_rblocks, char *msg)
 }
 
 
-// FIXME - what really to do if n_rblocks on drive doesn't match index?
+/**
+ * 在碎片整理过程中移动记录到新位置
+ * 这是碎片整理的核心函数，负责将有效记录从碎片化的块迁移到新的块中
+ *
+ * @param src_ssd 源SSD驱动器
+ * @param src_wblock_id 源写块ID
+ * @param flat 要移动的扁平化记录
+ * @param r 索引中的记录指针
+ *
+ * 实现流程：
+ * 1. 根据记录的digest确定目标设备
+ * 2. 获取或创建defrag专用的写缓冲区
+ * 3. 检查缓冲区空间，不足时刷写并获取新缓冲区
+ * 4. 复制记录数据到新位置
+ * 5. 更新索引中的记录位置信息
+ * 6. 释放原位置的空间
+ */
 void
 defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 		as_flat_record *flat, as_index *r)
@@ -606,9 +821,8 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 
 	drv_ssds *ssds = (drv_ssds*)src_ssd->ns->storage_private;
 
-	// Figure out which device to write to. When replacing an old record, it's
-	// possible this is different from the old device (e.g. if we've added a
-	// fresh device), so derive it from the digest each time.
+	// 确定要写入的设备。在替换旧记录时，可能与旧设备不同
+	// (例如，如果我们添加了新设备)，所以每次都从digest派生
 	drv_ssd *ssd = &ssds->ssds[ssd_get_file_id(ssds, &flat->keyd)];
 
 	cf_assert(ssd, AS_DRV_SSD, "{%s} null ssd", ssds->ns->name);
@@ -616,12 +830,14 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 	uint32_t ssd_n_rblocks = flat->n_rblocks;
 	uint32_t write_size = N_RBLOCKS_TO_SIZE(ssd_n_rblocks);
 
+	// 获取碎片整理锁，确保同一时间只有一个线程在进行碎片整理
 	cf_mutex_lock(&ssd->defrag_lock);
 
 	ssd_write_buf *swb = ssd->defrag_swb;
 
+	// 如果没有碎片整理专用缓冲区，则获取一个
 	if (! swb) {
-		swb = swb_get(ssd, true);
+		swb = swb_get(ssd, true); // 使用保留空间
 		ssd->defrag_swb = swb;
 
 		if (! swb) {
@@ -631,42 +847,44 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 		}
 	}
 
-	// Check if there's enough space in defrag buffer - if not, enqueue it to be
-	// flushed to device, and grab a new buffer.
+	// 检查碎片整理缓冲区是否有足够空间 - 如果没有，将其排队刷写到设备，并获取新缓冲区
 	if (write_size > WBLOCK_SZ - swb->pos) {
-		// Enqueue the buffer, to be flushed to device.
+		// 将缓冲区排队，等待刷写到设备
 		push_wblock_to_write_q(ssd, swb);
 		ssd->n_defrag_wblock_writes++;
 
-		// Get the new buffer.
+		// 获取新缓冲区
 		while ((swb = swb_get(ssd, true)) == NULL) {
-			// If we got here, we used all our reserve wblocks, but the wblocks
-			// we defragged must still have non-zero inuse_sz. Must wait for
-			// those to become free.
+			// 如果执行到这里，说明我们用完了所有保留的写块，但我们碎片整理的写块
+			// 必须仍然有非零的inuse_sz。必须等待这些写块变为空闲
 			cf_ticker_warning(AS_DRV_SSD, "{%s} defrag: drive %s totally full - waiting for vacated wblocks to be freed",
 					ssd->ns->name, ssd->name);
 
-			usleep(10 * 1000);
+			usleep(10 * 1000); // 等待10毫秒
 		}
 
 		ssd->defrag_swb = swb;
 	}
 
+	// 将记录数据复制到新位置
 	memcpy(swb->buf + swb->pos, (const uint8_t*)flat, write_size);
 
 	uint64_t write_offset = WBLOCK_ID_TO_OFFSET(swb->wblock_id) + swb->pos;
 
+	// 更新索引中的记录位置信息
 	r->file_id = ssd->file_id;
 	r->rblock_id = OFFSET_TO_RBLOCK_ID(write_offset);
 	r->n_rblocks = ssd_n_rblocks;
 
+	// 更新缓冲区位置
 	swb->pos += write_size;
 
+	// 更新使用空间统计
 	as_add_uint64(&ssd->inuse_size, (int64_t)write_size);
 	as_add_uint32(&ssd->wblock_state[swb->wblock_id].inuse_sz,
 			(int32_t)write_size);
 
-	// If we just defragged into a new destination swb, count it.
+	// 如果我们刚刚碎片整理到一个新的目标swb，则计数它
 	if (swb_add_unique_vacated_wblock(swb, src_ssd->file_id, src_wblock_id)) {
 		ssd_wblock_state* p_wblock_state =
 				&src_ssd->wblock_state[src_wblock_id];
@@ -676,10 +894,27 @@ defrag_move_record(drv_ssd *src_ssd, uint32_t src_wblock_id,
 
 	cf_mutex_unlock(&ssd->defrag_lock);
 
+	// 释放旧位置的空间
 	ssd_block_free(src_ssd, old_rblock_id, old_n_rblocks, "defrag-write");
 }
 
 
+/**
+ * 在碎片整理过程中处理单个记录
+ * 检查记录是否仍然有效并决定是否需要移动
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param wblock_id 正在碎片整理的写块ID
+ * @param flat 磁盘上的扁平化记录
+ * @param rblock_id 记录块ID
+ * @return 0表示记录有效并已移动，-1表示记录已被覆盖，-2表示记录已被删除
+ *
+ * 处理逻辑：
+ * 1. 根据记录key查找索引树中的记录
+ * 2. 检查记录是否仍然指向同一位置(未被覆盖)
+ * 3. 如果有效则调用defrag_move_record移动记录
+ * 4. 返回处理结果用于统计
+ */
 int
 ssd_record_defrag(drv_ssd *ssd, uint32_t wblock_id, as_flat_record *flat,
 		uint64_t rblock_id)
@@ -688,40 +923,46 @@ ssd_record_defrag(drv_ssd *ssd, uint32_t wblock_id, as_flat_record *flat,
 	as_partition_reservation rsv;
 	uint32_t pid = as_partition_getid(&flat->keyd);
 
+	// 保留分区以确保索引树的一致性
 	as_partition_reserve(ns, pid, &rsv);
 
 	int rv;
 	as_index_ref r_ref;
+	// 在索引树中查找记录
 	bool found = 0 == as_record_get(rsv.tree, &flat->keyd, &r_ref);
 
 	if (found) {
 		as_index *r = r_ref.r;
 
+		// 检查索引中的记录是否仍然指向磁盘上的同一位置
 		if (r->file_id == ssd->file_id && r->rblock_id == rblock_id) {
+			// 检查generation是否匹配(调试信息)
 			if (r->generation != flat->generation) {
 				cf_warning(AS_DRV_SSD, "device %s defrag: rblock_id %lu generation mismatch (%u:%u) %pD",
 						ssd->name, rblock_id, r->generation, flat->generation,
 						&r->keyd);
 			}
 
+			// 检查块数是否匹配(调试信息)
 			if (r->n_rblocks != flat->n_rblocks) {
 				cf_warning(AS_DRV_SSD, "device %s defrag: rblock_id %lu n_blocks mismatch (%u:%u) %pD",
 						ssd->name, rblock_id, r->n_rblocks, flat->n_rblocks,
 						&r->keyd);
 			}
 
+			// 记录仍然有效，移动它
 			defrag_move_record(ssd, wblock_id, flat, r);
 
-			rv = 0; // record was in index tree and current - moved it
+			rv = 0; // 记录在索引树中且为当前版本 - 已移动
 		}
 		else {
-			rv = -1; // record was in index tree - presumably was overwritten
+			rv = -1; // 记录在索引树中 - 但已被覆盖
 		}
 
 		as_record_done(&r_ref, ns);
 	}
 	else {
-		rv = -2; // record was not in index tree - presumably was deleted
+		rv = -2; // 记录不在索引树中 - 已被删除
 	}
 
 	as_partition_release(&rsv);
@@ -730,6 +971,22 @@ ssd_record_defrag(drv_ssd *ssd, uint32_t wblock_id, as_flat_record *flat,
 }
 
 
+/**
+ * 对整个写块进行碎片整理
+ * 这是碎片整理的主要工作函数，处理单个写块中的所有记录
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param wblock_id 要进行碎片整理的写块ID
+ * @param read_buf 用于读取写块内容的缓冲区
+ * @return 成功移动的记录数量
+ *
+ * 处理流程：
+ * 1. 检查写块是否有有效数据，没有则跳过I/O
+ * 2. 分批读取整个写块内容到内存
+ * 3. 遍历写块中的每个记录
+ * 4. 对有效记录调用ssd_record_defrag进行处理
+ * 5. 完成后释放被清空的写块
+ */
 int
 ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 {
@@ -741,14 +998,16 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 	cf_assert(p_wblock_state->n_vac_dests == 0, AS_DRV_SSD,
 			"n-vacations not 0 beginning defrag wblock");
 
-	// Make sure this can't decrement to 0 while defragging this wblock.
+	// 确保在碎片整理此写块期间，这个计数器不会递减到0
 	p_wblock_state->n_vac_dests = 1;
 
+	// 如果写块已经没有使用的空间，跳过I/O操作
 	if (as_load_uint32(&p_wblock_state->inuse_sz) == 0) {
 		as_incr_uint64(&ssd->n_wblock_defrag_io_skips);
 		goto Finished;
 	}
 
+	// 获取文件描述符并准备读取
 	int fd = ssd_fd_get(ssd);
 	uint64_t file_offset = WBLOCK_ID_TO_OFFSET(wblock_id);
 
@@ -757,9 +1016,11 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 	uint64_t end_offset = offset + WBLOCK_SZ;
 	uint8_t* at = read_buf;
 
+	// 分批读取整个写块内容
 	while (offset < end_offset) {
 		uint64_t start_ns = ns->storage_benchmarks_enabled ? cf_getns() : 0;
 
+		// 读取一个刷写大小的数据块
 		if (! pread_all(fd, at, flush_sz, (off_t)offset)) {
 			cf_warning(AS_DRV_SSD, "%s: read failed: errno %d (%s)", ssd->name,
 					errno, cf_strerror(errno));
@@ -769,6 +1030,7 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 			goto Finished;
 		}
 
+		// 记录读取性能统计
 		if (start_ns != 0) {
 			histogram_insert_data_point(ssd->hist_large_block_read, start_ns);
 		}
@@ -776,6 +1038,7 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 		at += flush_sz;
 		offset += flush_sz;
 
+		// 碎片整理休眠设置，避免过度占用I/O资源
 		uint32_t sleep_us = as_load_uint32(&ns->storage_defrag_sleep);
 
 		if (sleep_us != 0) {
@@ -783,33 +1046,38 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 		}
 	}
 
+	// 归还文件描述符
 	ssd_fd_put(ssd, fd);
 
+	// 检查是否需要预取优化
 	bool prefetch = cf_arenax_want_prefetch(ns->arena);
 
 	if (prefetch) {
 		ssd_prefetch_wblock(ssd, file_offset, read_buf);
 	}
 
-	uint32_t indent = 0; // current offset within the wblock, in bytes
+	uint32_t indent = 0; // 写块内的当前偏移量(字节)
 
+	// 遍历写块中的所有记录
 	while (indent < WBLOCK_SZ &&
 			as_load_uint32(&p_wblock_state->inuse_sz) != 0) {
 		as_flat_record *flat = (as_flat_record*)&read_buf[indent];
 
+		// 如果没有预取，则需要解密
 		if (! prefetch) {
 			ssd_decrypt(ssd, file_offset + indent, flat);
 		}
 
+		// 检查magic数字
 		if (flat->magic != AS_FLAT_MAGIC) {
-			// First block must have magic.
+			// 第一个块必须有magic
 			if (indent == 0) {
 				cf_warning(AS_DRV_SSD, "%s: no magic at beginning of used wblock %d",
 						ssd->name, wblock_id);
 				break;
 			}
 
-			// Later blocks may have no magic, just skip to next block.
+			// 后续块可能没有magic，跳到下一个块
 			indent += RBLOCK_SIZE;
 			continue;
 		}
@@ -817,19 +1085,20 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 		uint32_t record_size = N_RBLOCKS_TO_SIZE(flat->n_rblocks);
 		uint32_t next_indent = indent + record_size;
 
+		// 验证记录大小的合理性
 		if (record_size < DRV_RECORD_MIN_SIZE || next_indent > WBLOCK_SZ) {
 			cf_warning(AS_DRV_SSD, "%s: bad record size %u", ssd->name,
 					record_size);
 			indent += RBLOCK_SIZE;
-			continue; // try next rblock
+			continue; // 尝试下一个rblock
 		}
 
-		// Found a good record, move it if it's current.
+		// 找到一个有效记录，检查是否为当前版本并移动它
 		int rv = ssd_record_defrag(ssd, wblock_id, flat,
 				OFFSET_TO_RBLOCK_ID(file_offset + indent));
 
 		if (rv == 0) {
-			record_count++;
+			record_count++; // 成功移动的记录计数
 		}
 
 		indent = next_indent;
@@ -837,10 +1106,9 @@ ssd_defrag_wblock(drv_ssd *ssd, uint32_t wblock_id, uint8_t *read_buf)
 
 Finished:
 
-	// Note - usually wblock's inuse_sz is 0 here, but may legitimately be non-0
-	// e.g. if a dropped partition's tree is not done purging. In this case, we
-	// may have found deleted records in the wblock whose used-size contribution
-	// has not yet been subtracted.
+	// 注意 - 通常这里写块的inuse_sz为0，但可能合法地非0
+	// 例如，如果删除的分区树尚未完成清理。在这种情况下，我们可能在写块中
+	// 找到了已删除的记录，其使用大小贡献尚未被减去
 
 	ssd_release_vacated_wblock(ssd, wblock_id, p_wblock_state);
 
@@ -848,41 +1116,64 @@ Finished:
 }
 
 
-// Thread "run" function to service a device's defrag queue.
+/**
+ * 碎片整理线程的主运行函数
+ * 每个SSD设备都有一个专门的碎片整理线程来处理其碎片整理队列
+ *
+ * @param pv_data SSD驱动器结构体指针(作为void*传入)
+ * @return NULL(线程永不退出)
+ *
+ * 工作流程：
+ * 1. 持续监听碎片整理队列
+ * 2. 根据队列最小值设置决定是否处理
+ * 3. 对出队的写块调用ssd_defrag_wblock进行碎片整理
+ * 4. 控制写队列大小，避免过度积压
+ */
 void*
 run_defrag(void *pv_data)
 {
 	drv_ssd *ssd = (drv_ssd*)pv_data;
 	as_namespace *ns = ssd->ns;
 	uint32_t wblock_id;
+	// 分配读取缓冲区，用于碎片整理过程中读取写块内容
 	uint8_t *read_buf = cf_valloc(WBLOCK_SZ);
 
 	while (true) {
 		uint32_t q_min = as_load_uint32(&ns->storage_defrag_queue_min);
 
 		if (q_min == 0) {
+			// 没有最小队列限制，直接等待队列中的写块
 			cf_queue_pop(ssd->defrag_wblock_q, &wblock_id, CF_QUEUE_FOREVER);
 		}
 		else {
+			// 有最小队列限制，只有当队列大小超过限制时才处理
 			if (cf_queue_sz(ssd->defrag_wblock_q) <= q_min) {
-				usleep(1000 * 50);
+				usleep(1000 * 50); // 等待50毫秒
 				continue;
 			}
 
 			cf_queue_pop(ssd->defrag_wblock_q, &wblock_id, CF_QUEUE_NOWAIT);
 		}
 
+		// 对写块进行碎片整理
 		ssd_defrag_wblock(ssd, wblock_id, read_buf);
 
+		// 控制写队列大小，避免过度积压导致内存压力
 		while (ns->n_wblocks_to_flush > ns->storage_max_write_q + 128) {
-			usleep(1000);
+			usleep(1000); // 等待1毫秒让写队列有时间处理
 		}
 	}
 
-	return NULL;
+	return NULL; // 永不到达
 }
 
 
+/**
+ * 为所有SSD设备启动碎片整理线程
+ * 每个SSD设备都会创建一个独立的碎片整理线程
+ *
+ * @param ssds SSD驱动器组结构体指针
+ */
 void
 ssd_start_defrag_threads(drv_ssds *ssds)
 {
@@ -891,50 +1182,75 @@ ssd_start_defrag_threads(drv_ssds *ssds)
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		drv_ssd *ssd = &ssds->ssds[i];
 
+		// 为每个SSD创建一个分离的碎片整理线程
 		cf_thread_create_detached(run_defrag, (void*)ssd);
 	}
 }
 
 
 //------------------------------------------------
-// defrag_pen class.
+// defrag_pen类 - 碎片整理笔(用于按使用率分组写块)
+//
+// 用于在启动时按照使用率对写块进行分组，确保碎片整理
+// 优先处理使用率最低(碎片最多)的写块
 //
 
 #define DEFRAG_PEN_INIT_CAPACITY (8 * 1024)
 
 typedef struct defrag_pen_s {
-	uint32_t n_ids;
-	uint32_t capacity;
-	uint32_t *ids;
-	uint32_t stack_ids[DEFRAG_PEN_INIT_CAPACITY];
+	uint32_t n_ids;          // 当前存储的写块ID数量
+	uint32_t capacity;       // 数组容量
+	uint32_t *ids;          // 写块ID数组指针
+	uint32_t stack_ids[DEFRAG_PEN_INIT_CAPACITY]; // 栈上的初始数组
 } defrag_pen;
 
+/**
+ * 初始化碎片整理笔
+ *
+ * @param pen 碎片整理笔结构体指针
+ */
 static void
 defrag_pen_init(defrag_pen *pen)
 {
 	pen->n_ids = 0;
 	pen->capacity = DEFRAG_PEN_INIT_CAPACITY;
-	pen->ids = pen->stack_ids;
+	pen->ids = pen->stack_ids; // 初始使用栈上数组
 }
 
+/**
+ * 销毁碎片整理笔，释放动态分配的内存
+ *
+ * @param pen 碎片整理笔结构体指针
+ */
 static void
 defrag_pen_destroy(defrag_pen *pen)
 {
+	// 只有当使用堆内存时才需要释放
 	if (pen->ids != pen->stack_ids) {
 		cf_free(pen->ids);
 	}
 }
 
+/**
+ * 向碎片整理笔添加写块ID
+ * 如果容量不足会自动扩展
+ *
+ * @param pen 碎片整理笔结构体指针
+ * @param wblock_id 要添加的写块ID
+ */
 static void
 defrag_pen_add(defrag_pen *pen, uint32_t wblock_id)
 {
+	// 检查是否需要扩展容量
 	if (pen->n_ids == pen->capacity) {
 		if (pen->capacity == DEFRAG_PEN_INIT_CAPACITY) {
-			pen->capacity <<= 2;
+			// 第一次扩展：从栈数组迁移到堆数组
+			pen->capacity <<= 2; // 扩大4倍
 			pen->ids = cf_malloc(pen->capacity * sizeof(uint32_t));
 			memcpy(pen->ids, pen->stack_ids, sizeof(pen->stack_ids));
 		}
 		else {
+			// 后续扩展：堆数组加倍
 			pen->capacity <<= 1;
 			pen->ids = cf_realloc(pen->ids, pen->capacity * sizeof(uint32_t));
 		}
@@ -943,10 +1259,16 @@ defrag_pen_add(defrag_pen *pen, uint32_t wblock_id)
 	pen->ids[pen->n_ids++] = wblock_id;
 }
 
+/**
+ * 将碎片整理笔中的所有写块ID转移到SSD的碎片整理队列
+ * 为了性能考虑，直接操作而不使用push_wblock_to_defrag_q()
+ *
+ * @param pen 碎片整理笔结构体指针
+ * @param ssd SSD驱动器结构体指针
+ */
 static void
 defrag_pen_transfer(defrag_pen *pen, drv_ssd *ssd)
 {
-	// For speed, "customize" instead of using push_wblock_to_defrag_q()...
 	for (uint32_t i = 0; i < pen->n_ids; i++) {
 		uint32_t wblock_id = pen->ids[i];
 
@@ -955,6 +1277,14 @@ defrag_pen_transfer(defrag_pen *pen, drv_ssd *ssd)
 	}
 }
 
+/**
+ * 打印碎片整理笔的分布情况(调试信息)
+ * 显示不同使用率区间内的写块数量
+ *
+ * @param pens 碎片整理笔数组
+ * @param n_pens 数组大小
+ * @param ssd_name SSD设备名称
+ */
 static void
 defrag_pens_dump(defrag_pen pens[], uint32_t n_pens, const char* ssd_name)
 {
@@ -970,26 +1300,39 @@ defrag_pens_dump(defrag_pen pens[], uint32_t n_pens, const char* ssd_name)
 }
 
 //
-// END - defrag_pen class.
+// END - defrag_pen类
 //------------------------------------------------
 
 
-// Thread "run" function to create and load a device's (wblock) free & defrag
-// queues at startup. Sorts defrag-eligible wblocks so the most depleted ones
-// are at the head of the defrag queue.
+/**
+ * 线程运行函数：在启动时创建和加载设备的(写块)空闲和碎片整理队列
+ * 对符合碎片整理条件的写块进行排序，使最空的写块位于碎片整理队列的头部
+ *
+ * @param pv_data SSD驱动器结构体指针(作为void*传入)
+ * @return NULL
+ *
+ * 处理流程：
+ * 1. 创建空闲写块队列和碎片整理队列
+ * 2. 按使用率创建多个碎片整理笔进行分组
+ * 3. 遍历所有已使用的写块，根据使用情况分类
+ * 4. 将分组后的写块按使用率从低到高加入碎片整理队列
+ */
 void*
 run_load_queues(void *pv_data)
 {
 	drv_ssd *ssd = (drv_ssd*)pv_data;
 
+	// 创建空闲写块队列和碎片整理队列
 	ssd->free_wblock_q = cf_queue_create(sizeof(uint32_t), true);
 	ssd->defrag_wblock_q = cf_queue_create(sizeof(uint32_t), true);
 
 	as_namespace *ns = ssd->ns;
 	uint32_t lwm_pct = ns->storage_defrag_lwm_pct;
 	uint32_t lwm_size = ns->defrag_lwm_size;
+	// 创建碎片整理笔数组，按使用率百分比分组
 	defrag_pen pens[lwm_pct];
 
+	// 初始化所有碎片整理笔
 	for (uint32_t n = 0; n < lwm_pct; n++) {
 		defrag_pen_init(&pens[n]);
 	}
@@ -997,57 +1340,74 @@ run_load_queues(void *pv_data)
 	uint32_t first_id = ssd->first_wblock_id;
 	uint32_t end_id = ssd->pristine_wblock_id;
 
-	// TODO - paranoia - remove eventually.
+	// TODO - 偏执检查 - 最终移除
 	cf_assert(end_id >= first_id && end_id <= ssd->n_wblocks, AS_DRV_SSD,
 			"%s bad pristine-wblock-id %u", ssd->name, end_id);
 
+	// 遍历所有已使用的写块进行分类
 	for (uint32_t wblock_id = first_id; wblock_id < end_id; wblock_id++) {
 		uint32_t inuse_sz = ssd->wblock_state[wblock_id].inuse_sz;
 
 		if (inuse_sz == 0) {
-			// Faster than using push_wblock_to_free_q() here...
+			// 空闲写块直接加入空闲队列(这里比使用push_wblock_to_free_q()更快)
 			cf_queue_push(ssd->free_wblock_q, &wblock_id);
 		}
 		else if (inuse_sz < lwm_size) {
+			// 使用率低于阈值的写块加入对应的碎片整理笔
+			// 根据使用率计算应该放入哪个笔(使用率越低，笔的索引越小)
 			defrag_pen_add(&pens[(inuse_sz * lwm_pct) / lwm_size], wblock_id);
 		}
 		else {
+			// 使用率高的写块标记为已使用状态
 			ssd->wblock_state[wblock_id].state = WBLOCK_STATE_USED;
 		}
 	}
 
+	// 打印碎片整理分布情况
 	defrag_pens_dump(pens, lwm_pct, ssd->name);
 
+	// 将碎片整理笔中的写块转移到碎片整理队列
+	// 从使用率最低的开始，确保最需要碎片整理的写块优先处理
 	for (uint32_t n = 0; n < lwm_pct; n++) {
 		defrag_pen_transfer(&pens[n], ssd);
 		defrag_pen_destroy(&pens[n]);
 	}
 
+	// 记录碎片整理队列的初始大小
 	ssd->n_defrag_wblock_reads = (uint64_t)cf_queue_sz(ssd->defrag_wblock_q);
 
 	return NULL;
 }
 
 
+/**
+ * 加载所有SSD设备的写块队列(空闲队列和碎片整理队列)
+ * 使用多线程并行处理以提高启动速度
+ *
+ * @param ssds SSD驱动器组结构体指针
+ */
 void
 ssd_load_wblock_queues(drv_ssds *ssds)
 {
 	cf_info(AS_DRV_SSD, "{%s} loading free & defrag queues", ssds->ns->name);
 
-	// Split this task across multiple threads.
+	// 将此任务拆分到多个线程中
 	cf_tid tids[ssds->n_ssds];
 
+	// 为每个SSD创建一个队列加载线程
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		drv_ssd *ssd = &ssds->ssds[i];
 
 		tids[i] = cf_thread_create_joinable(run_load_queues, (void*)ssd);
 	}
 
+	// 等待所有线程完成
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		cf_thread_join(tids[i]);
 	}
-	// Now we're single-threaded again.
+	// 现在我们又回到单线程模式
 
+	// 打印每个SSD的队列加载结果
 	for (int i = 0; i < ssds->n_ssds; i++) {
 		drv_ssd *ssd = &ssds->ssds[i];
 
@@ -1059,6 +1419,12 @@ ssd_load_wblock_queues(drv_ssds *ssds)
 }
 
 
+/**
+ * 初始化SSD设备的写块状态数组
+ * 为每个写块分配状态结构体并初始化
+ *
+ * @param ssd SSD驱动器结构体指针
+ */
 void
 ssd_wblock_init(drv_ssd *ssd)
 {
@@ -1070,7 +1436,7 @@ ssd_wblock_init(drv_ssd *ssd)
 	ssd->n_wblocks = n_wblocks;
 	ssd->wblock_state = cf_malloc(n_wblocks * sizeof(ssd_wblock_state));
 
-	// Device header wblocks' inuse_sz will (also) be 0 but that doesn't matter.
+	// 设备头部写块的inuse_sz也将为0，但这无关紧要
 	for (uint32_t i = 0; i < n_wblocks; i++) {
 		ssd_wblock_state * p_wblock_state = &ssd->wblock_state[i];
 
@@ -1084,9 +1450,19 @@ ssd_wblock_init(drv_ssd *ssd)
 
 
 //==========================================================
-// Record reading utilities.
+// 记录读取工具函数
 //
 
+/**
+ * 对从磁盘读取的扁平化记录进行完整性检查
+ * 验证magic数字、块数量、digest等关键字段
+ *
+ * @param ssd SSD驱动器结构体指针
+ * @param r 索引中的记录指针
+ * @param record_offset 记录在磁盘上的偏移量
+ * @param flat 从磁盘读取的扁平化记录
+ * @return true表示检查通过，false表示发现错误
+ */
 static bool
 sanity_check_flat(const drv_ssd *ssd, const as_record *r,
 		uint64_t record_offset, const as_flat_record *flat)
@@ -1094,42 +1470,49 @@ sanity_check_flat(const drv_ssd *ssd, const as_record *r,
 	as_namespace *ns = ssd->ns;
 	bool ok = true;
 
+	// 检查magic数字
 	if (flat->magic != AS_FLAT_MAGIC) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad magic 0x%x offset %lu",
 				ns->name, ssd->name, &r->keyd, flat->magic, record_offset);
 		ok = false;
 	}
 
+	// 检查块数量
 	if (flat->n_rblocks != r->n_rblocks) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad n-rblocks %u expecting %u",
 				ns->name, ssd->name, &r->keyd, flat->n_rblocks, r->n_rblocks);
 		ok = false;
 	}
 
+	// 检查digest匹配
 	if (cf_digest_compare(&flat->keyd, &r->keyd) != 0) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD but found flat digest %pD",
 				ns->name, ssd->name, &r->keyd, &flat->keyd);
 		ok = false;
 	}
 
+	// 检查XDR写标志
 	if (flat->xdr_write != r->xdr_write) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad xdr-write %u expecting %u",
 				ns->name, ssd->name, &r->keyd, flat->xdr_write, r->xdr_write);
 		ok = false;
 	}
 
+	// 检查树ID
 	if (flat->tree_id != r->tree_id) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad tree-id %u expecting %u",
 				ns->name, ssd->name, &r->keyd, flat->tree_id, r->tree_id);
 		ok = false;
 	}
 
+	// 检查generation
 	if (flat->generation != r->generation) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad generation %u expecting %u",
 				ns->name, ssd->name, &r->keyd, flat->generation, r->generation);
 		ok = false;
 	}
 
+	// 检查最后更新时间
 	if (flat->last_update_time != r->last_update_time) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad lut %lu expecting %lu",
 				ns->name, ssd->name, &r->keyd, (uint64_t)flat->last_update_time,
@@ -1141,6 +1524,21 @@ sanity_check_flat(const drv_ssd *ssd, const as_record *r,
 }
 
 
+/**
+ * 从SSD设备读取记录数据
+ * 这是SSD存储引擎的核心读取函数，支持从写缓冲区或磁盘读取
+ *
+ * @param rd 存储读取描述符
+ * @param pickle_only 是否只读取pickle数据(序列化元数据)
+ * @return 0表示成功，-1表示失败
+ *
+ * 读取流程：
+ * 1. 验证记录偏移和大小的合法性
+ * 2. 优先从写缓冲区读取(如果数据在缓冲区中)
+ * 3. 否则从磁盘设备读取数据
+ * 4. 解密数据并进行完整性检查
+ * 5. 解析记录元数据和bin数据
+ */
 int
 ssd_read_record(as_storage_rd *rd, bool pickle_only)
 {
@@ -1156,18 +1554,21 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 
 	bool ok = true;
 
+	// 验证写块ID的合法性
 	if (wblock_id >= ssd->n_wblocks || wblock_id < ssd->first_wblock_id) {
 		cf_warning(AS_DRV_SSD, "{%s} read: digest %pD bad offset %lu", ns->name,
 				&r->keyd, record_offset);
 		ok = false;
 	}
 
+	// 验证记录大小的合法性
 	if (record_size < DRV_RECORD_MIN_SIZE) {
 		cf_warning(AS_DRV_SSD, "{%s} read: digest %pD bad record size %u",
 				ns->name, &r->keyd, record_size);
 		ok = false;
 	}
 
+	// 验证记录不跨越写块边界
 	if (record_end_offset > WBLOCK_ID_TO_OFFSET(wblock_id + 1)) {
 		cf_warning(AS_DRV_SSD, "{%s} read: digest %pD record size %u crosses wblock boundary",
 				ns->name, &r->keyd, record_size);
@@ -1183,10 +1584,11 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 
 	ssd_write_buf *swb = NULL;
 
+	// 检查数据是否在写缓冲区中
 	swb_check_and_reserve(&ssd->wblock_state[wblock_id], &swb);
 
 	if (swb != NULL) {
-		// Data is in write buffer, so read it from there.
+		// 数据在写缓冲区中，从缓冲区读取
 		as_incr_uint32(&ns->n_reads_from_cache);
 
 		read_buf = cf_malloc(record_size);
@@ -1204,9 +1606,10 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 		}
 	}
 	else {
-		// Normal case - data is read from device.
+		// 正常情况 - 从设备读取数据
 		as_incr_uint32(&ns->n_reads_from_device);
 
+		// 计算对齐到I/O最小单位的读取范围
 		uint64_t read_offset = BYTES_DOWN_TO_IO_MIN(ssd, record_offset);
 		uint64_t read_end_offset = BYTES_UP_TO_IO_MIN(ssd, record_end_offset);
 		size_t read_size = read_end_offset - read_offset;
@@ -1214,11 +1617,13 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 
 		read_buf = cf_valloc(read_size);
 
+		// 根据是否使用页缓存选择合适的fd
 		int fd = rd->read_page_cache ? ssd_fd_cache_get(ssd) : ssd_fd_get(ssd);
 
 		uint64_t start_ns = ns->storage_benchmarks_enabled ? cf_getns() : 0;
 		uint64_t start_us = as_health_sample_device_read() ? cf_getus() : 0;
 
+		// 执行实际的磁盘读取操作
 		if (! pread_all(fd, read_buf, read_size, (off_t)read_offset)) {
 			cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD IO failed errno %d (%s) size %lu",
 					ns->name, ssd->name, &r->keyd, errno, cf_strerror(errno),
@@ -1231,12 +1636,14 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 			return -1;
 		}
 
+		// 记录性能统计
 		if (start_ns != 0) {
 			histogram_insert_data_point(ssd->hist_read, start_ns);
 		}
 
 		as_health_add_device_latency(ns->ix, r->file_id, start_us);
 
+		// 归还文件描述符
 		if (rd->read_page_cache) {
 			ssd_fd_cache_put(ssd, fd);
 		}
@@ -1245,6 +1652,7 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 		}
 
 		flat = (as_flat_record*)(read_buf + record_buf_indent);
+		// 解密整个记录
 		ssd_decrypt_whole(ssd, record_offset, r->n_rblocks, flat);
 
 		if (! sanity_check_flat(ssd, r, record_offset, flat)) {
@@ -1254,20 +1662,22 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 			return -1;
 		}
 
+		// 记录读取大小统计
 		if (ns->storage_benchmarks_enabled) {
 			histogram_insert_raw(ns->device_read_size_hist, read_size);
 		}
 	}
 
 	rd->flat = flat;
-	rd->read_buf = read_buf; // no need to free read_buf on error now
+	rd->read_buf = read_buf; // 现在不需要在出错时释放read_buf
 
 	as_flat_opt_meta opt_meta = { { 0 } };
 
-	// Includes round rblock padding, so may not literally exclude the mark.
-	// (Is set exactly to mark below, if skipping or decompressing bins.)
+	// 包含舍入的块填充，所以可能不会字面上排除标记
+	// (如果跳过或解压缩bin，则在下面精确设置为标记)
 	rd->flat_end = (const uint8_t*)flat + record_size - END_MARK_SZ;
 
+	// 解析记录元数据
 	rd->flat_bins = as_flat_unpack_record_meta(flat, rd->flat_end, &opt_meta);
 
 	if (rd->flat_bins == NULL) {
@@ -1279,6 +1689,7 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 	rd->flat_n_bins = (uint16_t)opt_meta.n_bins;
 
 	if (pickle_only) {
+		// 只需要pickle数据，跳过bin数据解析
 		if (! as_flat_skip_bins(&opt_meta.cm, rd)) {
 			cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad bin data",
 					ns->name, ssd->name, &r->keyd);
@@ -1288,17 +1699,19 @@ ssd_read_record(as_storage_rd *rd, bool pickle_only)
 		return 0;
 	}
 
+	// 解压缩bin数据
 	if (! as_flat_decompress_bins(&opt_meta.cm, rd)) {
 		cf_warning(AS_DRV_SSD, "{%s} read %s: digest %pD bad compressed data",
 				ns->name, ssd->name, &r->keyd);
 		return -1;
 	}
 
+	// 如果有key数据，设置到rd中
 	if (opt_meta.key != NULL) {
 		rd->key_size = opt_meta.key_size;
 		rd->key = opt_meta.key;
 	}
-	// else - if updating record without key, leave rd (msg) key to be stored.
+	// 否则 - 如果在没有key的情况下更新记录，保留rd(msg) key以供存储
 
 	return 0;
 }
@@ -1562,6 +1975,20 @@ ssd_shadow_flush_buf(drv_ssd *ssd, const uint8_t *buf, off_t write_offset,
 }
 
 
+/**
+ * 将写缓冲区刷新到 SSD 设备
+ *
+ * 此函数将写缓冲区中的数据写入到对应的 SSD 设备上。这是数据持久化的
+ * 关键步骤，确保内存中的数据安全地写入到持久存储中。主要功能包括：
+ * 1. 等待所有写入者完成写入
+ * 2. 计算写入偏移位置
+ * 3. 如果需要，对数据进行加密
+ * 4. 清理缓冲区未使用的尾部
+ * 5. 执行实际的磁盘写入操作
+ *
+ * @param ssd 指向目标 SSD 设备结构的指针
+ * @param swb 指向要刷新的写缓冲区的指针
+ */
 void
 ssd_flush_swb(drv_ssd *ssd, ssd_write_buf *swb)
 {
@@ -1610,6 +2037,19 @@ ssd_write_sanity_checks(drv_ssd *ssd, ssd_write_buf *swb)
 }
 
 
+/**
+ * 处理写入后的清理工作
+ *
+ * 在写缓冲区成功刷新到设备后，此函数负责执行后续的清理和处理工作。
+ * 根据配置，写缓冲区可能会被转移到后写队列进行进一步处理，
+ * 或者直接释放以供重用。主要功能包括：
+ * 1. 释放加密缓冲区内存（如果使用了加密）
+ * 2. 根据配置决定是否使用后写队列
+ * 3. 将缓冲区转移到后写队列或直接释放
+ *
+ * @param ssd 指向 SSD 设备结构的指针
+ * @param swb 指向已完成写入的写缓冲区的指针
+ */
 void
 ssd_post_write(drv_ssd *ssd, ssd_write_buf *swb)
 {
@@ -1716,6 +2156,14 @@ run_shadow(void *arg)
 }
 
 
+/**
+ * 启动 SSD 写入线程
+ *
+ * 为每个 SSD 设备启动专门的写入线程，用于将内存中的写缓冲区数据刷新到磁盘。
+ * 如果配置了影子设备（shadow device），还会为每个影子设备启动对应的写入线程。
+ *
+ * @param ssds 指向 SSD 驱动器集合的指针
+ */
 void
 ssd_start_write_threads(drv_ssds *ssds)
 {
@@ -1733,6 +2181,20 @@ ssd_start_write_threads(drv_ssds *ssds)
 }
 
 
+/**
+ * 将记录的 bins 数据缓冲到写缓冲区
+ *
+ * 此函数负责准备记录数据并将其放入SSD的写缓冲区中，等待后续刷新到磁盘。
+ * 主要功能包括：
+ * 1. 计算记录的序列化大小并检查是否超过限制
+ * 2. 压缩和打包记录数据（如果需要）
+ * 3. 在当前写缓冲区中预留空间
+ * 4. 如果当前缓冲区空间不足，则将其排队刷新并获取新缓冲区
+ * 5. 将记录数据写入缓冲区并更新相关元数据
+ *
+ * @param rd 指向存储读取描述符的指针，包含要写入的记录信息
+ * @return 成功时返回0，失败时返回负的错误码
+ */
 int
 ssd_buffer_bins(as_storage_rd *rd)
 {
@@ -1903,6 +2365,20 @@ ssd_buffer_bins(as_storage_rd *rd)
 }
 
 
+/**
+ * 将记录写入 SSD 存储
+ *
+ * 此函数是 SSD 存储的主要写入入口点，负责将记录数据写入到适当的 SSD 设备上。
+ * 主要功能包括：
+ * 1. 处理记录替换场景，保存旧记录的位置信息
+ * 2. 根据记录的摘要确定目标 SSD 设备
+ * 3. 调用底层写入函数将数据写入缓冲区
+ * 4. 如果是替换操作，释放旧记录占用的存储空间
+ * 5. 处理就地写入的特殊情况
+ *
+ * @param rd 指向存储读取描述符的指针，包含要写入的记录信息
+ * @return 成功时返回 0，就地写入时返回 WRITE_IN_PLACE，失败时返回负的错误码
+ */
 int
 ssd_write(as_storage_rd *rd)
 {
@@ -2258,8 +2734,14 @@ ssd_flush_defrag_swb(drv_ssd *ssd, uint64_t *p_prev_n_defrag_writes)
 }
 
 
-// Check all wblocks to load a device's defrag queue at runtime. Triggered only
-// when defrag-lwm-pct is increased by manual intervention.
+/**
+ * 扫描所有写块以加载设备的碎片整理队列
+ *
+ * 此函数检查设备上的所有写块，将那些使用率低于碎片整理低水位线的写块
+ * 加入到碎片整理队列中。通常在手动增加 defrag-lwm-pct 参数时触发。
+ *
+ * @param ssd 指向要扫描的 SSD 设备结构的指针
+ */
 void
 ssd_defrag_sweep(drv_ssd *ssd)
 {
@@ -2300,7 +2782,21 @@ next_time(uint64_t now, uint64_t job_interval, uint64_t next)
 #define LOG_STATS_INTERVAL	(1000 * 1000 * LOG_STATS_INTERVAL_sec)
 #define FREE_SWBS_INTERVAL	(1000 * 1000 * 20)
 
-// Thread "run" function to perform various background jobs per device.
+/**
+ * SSD 维护线程运行函数
+ *
+ * 此函数作为后台线程运行，负责执行各种 SSD 设备的维护任务。维护工作包括：
+ * 1. 定期记录和报告存储统计信息
+ * 2. 刷新当前的写缓冲区到设备
+ * 3. 释放空闲的写缓冲区以回收内存
+ * 4. 刷新碎片整理缓冲区
+ * 5. 根据配置的时间间隔调度各种维护任务
+ *
+ * 该线程会持续运行直到设备停止，使用 usleep() 控制任务执行频率。
+ *
+ * @param udata 指向 SSD 设备结构的指针 (drv_ssd*)
+ * @return 总是返回 NULL
+ */
 void *
 run_ssd_maintenance(void *udata)
 {
@@ -2529,6 +3025,20 @@ ssd_read_header(drv_ssd *ssd)
 }
 
 
+/**
+ * 初始化 SSD 设备头部
+ *
+ * 为新的 SSD 设备创建并初始化头部结构。设备头部包含设备的元数据信息，
+ * 包括魔数、版本、命名空间名称、写块大小等基本信息。主要功能包括：
+ * 1. 分配并清零头部结构内存
+ * 2. 设置通用字段（魔数、版本、命名空间等）
+ * 3. 初始化设备特定的配置信息
+ * 4. 为设备分配唯一的设备 ID
+ *
+ * @param ns 指向命名空间结构的指针
+ * @param ssd 指向要初始化的 SSD 设备结构的指针
+ * @return 返回初始化完成的设备头部指针
+ */
 drv_header *
 ssd_init_header(as_namespace *ns, drv_ssd *ssd)
 {
@@ -2630,7 +3140,24 @@ prefer_existing_record(const as_namespace* ns, const as_flat_record* flat,
 }
 
 
-// Add a record just read from drive to the index, if all is well.
+/**
+ * 在冷启动过程中将记录添加到索引
+ *
+ * 此函数在冷启动扫描设备时被调用，用于将从磁盘读取的记录添加到内存索引中。
+ * 这是重建索引过程的核心函数，处理记录的验证、冲突解决和索引插入。
+ * 主要功能包括：
+ * 1. 验证分区和记录的合法性
+ * 2. 处理记录的生存时间 (TTL) 和过期检查
+ * 3. 解决与现有记录的冲突（如果存在）
+ * 4. 更新设备和写块的使用统计
+ * 5. 设置记录的存储位置信息
+ *
+ * @param ssds 指向 SSD 驱动器集合的指针
+ * @param ssd 指向包含记录的 SSD 设备的指针
+ * @param flat 指向扁平化记录数据的指针
+ * @param rblock_id 记录块 ID
+ * @param record_size 记录大小
+ */
 void
 ssd_cold_start_add_record(drv_ssds* ssds, drv_ssd* ssd,
 		const as_flat_record* flat, uint64_t rblock_id, uint32_t record_size)
@@ -2806,7 +3333,21 @@ ssd_cold_start_add_record(drv_ssds* ssds, drv_ssd* ssd,
 }
 
 
-// Sweep through a storage device to rebuild the index.
+/**
+ * 扫描存储设备以重建索引
+ *
+ * 此函数在冷启动时遍历整个存储设备，读取所有存储的记录并重建内存中的索引。
+ * 主要功能包括：
+ * 1. 逐个读取写块（write block），查找有效的记录
+ * 2. 验证记录的魔数（magic number）以确保数据完整性
+ * 3. 将找到的有效记录添加到内存索引中
+ * 4. 如果配置了影子设备，同时进行数据复制
+ * 5. 支持加密数据的解密处理
+ * 6. 在遇到连续空块时提前结束扫描以优化性能
+ *
+ * @param ssds 指向 SSD 驱动器集合的指针
+ * @param ssd 指向要扫描的特定 SSD 设备的指针
+ */
 void
 ssd_cold_start_sweep(drv_ssds *ssds, drv_ssd *ssd)
 {
@@ -2911,7 +3452,19 @@ ssd_cold_start_sweep(drv_ssds *ssds, drv_ssd *ssd)
 }
 
 
-// Thread "run" function to read a storage device and rebuild the index.
+/**
+ * SSD 冷启动线程运行函数
+ *
+ * 此函数作为独立线程运行，负责读取存储设备并重建索引。在冷启动过程中，
+ * 系统需要扫描所有持久化的数据来重建内存中的记录索引。主要工作包括：
+ * 1. 调用设备扫描函数来读取所有记录
+ * 2. 统计和报告加载的记录数量
+ * 3. 在所有设备完成加载后进行最终的清理工作
+ * 4. 通知完成队列任务已完成
+ *
+ * @param udata 包含加载信息的结构体指针 (ssd_load_records_info)
+ * @return 总是返回 NULL
+ */
 void *
 run_ssd_cold_start(void *udata)
 {
@@ -3237,6 +3790,20 @@ ssd_init_pristine_wblock_id(drv_ssd *ssd, uint64_t offset)
 }
 
 
+/**
+ * 同步初始化 SSD 存储系统
+ *
+ * 此函数负责初始化存储系统的核心组件，包括读取和验证设备头部信息，
+ * 设置加密密钥，以及准备设备进行正常操作。主要功能包括：
+ * 1. 生成随机签名用于设备验证
+ * 2. 读取所有设备的头部信息，如果是新设备则初始化头部
+ * 3. 验证设备间的一致性（相同的签名、版本等）
+ * 4. 设置加密相关配置
+ * 5. 确定是冷启动还是温启动模式
+ * 6. 初始化设备的写块 ID 和其他启动参数
+ *
+ * @param ssds 指向 SSD 驱动器集合的指针
+ */
 void
 ssd_init_synchronous(drv_ssds *ssds)
 {
@@ -3464,6 +4031,19 @@ find_io_min_size(int fd, const char *ssd_name)
 }
 
 
+/**
+ * 初始化 SSD 设备
+ *
+ * 为命名空间配置的所有原始设备初始化 SSD 驱动器结构。此函数负责：
+ * 1. 分配并初始化 drv_ssds 结构体
+ * 2. 为每个设备打开文件描述符并设置适当的标志
+ * 3. 获取设备大小并验证
+ * 4. 检测最小 I/O 大小
+ * 5. 如果配置了冷启动清空，则清除设备头部
+ *
+ * @param ns 指向命名空间结构的指针
+ * @param ssds_p 指向 SSD 驱动器集合指针的指针，用于返回初始化的结构
+ */
 void
 ssd_init_devices(as_namespace *ns, drv_ssds **ssds_p)
 {
@@ -3565,6 +4145,20 @@ ssd_init_shadow_devices(as_namespace *ns, drv_ssds *ssds)
 }
 
 
+/**
+ * 初始化 SSD 文件存储
+ *
+ * 为命名空间配置的所有文件存储初始化 SSD 驱动器结构。与设备存储不同，
+ * 文件存储使用常规文件系统文件而非原始设备。主要功能包括：
+ * 1. 分配并初始化 drv_ssds 结构体
+ * 2. 为每个存储文件设置基本参数
+ * 3. 如果配置了冷启动清空，则删除现有文件
+ * 4. 创建新的存储文件并设置适当大小
+ * 5. 检测文件系统的最小 I/O 大小
+ *
+ * @param ns 指向命名空间结构的指针
+ * @param ssds_p 指向 SSD 驱动器集合指针的指针，用于返回初始化的结构
+ */
 void
 ssd_init_files(as_namespace *ns, drv_ssds **ssds_p)
 {
@@ -3750,6 +4344,20 @@ ssd_set_trusted(drv_ssds *ssds)
 // Storage API implementation: startup, shutdown, etc.
 //
 
+/**
+ * 初始化 SSD 存储引擎
+ *
+ * 这是 SSD 存储引擎的主要初始化入口点，负责设置整个存储子系统。
+ * 主要功能包括：
+ * 1. 根据配置初始化原始设备或文件存储
+ * 2. 初始化影子设备（如果配置了）
+ * 3. 设置全局数据大小统计
+ * 4. 初始化各种队列和锁
+ * 5. 计算并设置存储相关的限制参数
+ * 6. 启动维护线程、写入线程和碎片整理线程
+ *
+ * @param ns 指向要初始化存储的命名空间的指针
+ */
 void
 as_storage_init_ssd(as_namespace *ns)
 {

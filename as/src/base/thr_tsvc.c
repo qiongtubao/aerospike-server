@@ -1,5 +1,23 @@
 /*
- * thr_tsvc.c
+ * thr_tsvc.c - 事务服务线程模块
+ *
+ * 模块职责：
+ * 本模块是 Aerospike 单条记录事务的统一分发入口。
+ * 客户端、批量子请求、代理请求等均经由 as_tsvc_process_transaction() 路由到具体处理路径：
+ *   - 查询请求（multi-record）   → as_query()
+ *   - 写请求（含 delete/UDF）   → as_write_start() / as_delete_start() / as_udf_start()
+ *   - 读请求                    → as_read_start()
+ *   - read-touch / re-replicate → as_read_touch_start() / as_re_replicate_start()
+ *   - 无法在本节点处理（partition 不在本节点）→ 代理转发 as_proxy_divert()
+ *
+ * 关键流程：
+ *   1. 安全认证检查
+ *   2. 解析 namespace 字段，获取 as_namespace*
+ *   3. 等待初始 partition balance 完成
+ *   4. 计算并检查事务超时
+ *   5. 预留 partition（写用 reserve_write，读用 reserve_read_tr）
+ *   6. 根据操作类型分发到对应处理函数，返回 transaction_status
+ *   7. 根据 status 决定是否释放 partition 预留及 msgp
  *
  * Copyright (C) 2008-2021 Aerospike, Inc.
  *
@@ -65,12 +83,23 @@
 // Inlines & macros.
 //
 
+/*
+ * 判断该事务是否需要执行数据操作权限检查。
+ * 只有来自客户端（FROM_CLIENT）或批量请求（FROM_BATCH）的事务才需要安全检查；
+ * 内部事务（代理、IUDF、IOPS 等）跳过此检查。
+ */
 static inline bool
 should_security_check_data_op(const as_transaction *tr)
 {
 	return tr->origin == FROM_CLIENT || tr->origin == FROM_BATCH;
 }
 
+/*
+ * 根据查询事务类型返回所需安全权限。
+ * - UDF 查询：PERM_UDF_QUERY
+ * - 写操作查询（带 INFO2_WRITE 标志）：PERM_OPS_QUERY
+ * - 普通只读查询：PERM_QUERY
+ */
 static inline as_sec_perm
 query_perm(const as_transaction *tr)
 {
@@ -82,6 +111,12 @@ query_perm(const as_transaction *tr)
 			PERM_OPS_QUERY : PERM_QUERY;
 }
 
+/*
+ * 返回写事务的操作类型标签字符串，用于日志输出。
+ * - delete 事务 → "delete"
+ * - UDF 事务   → "udf"
+ * - 普通写     → "write"
+ */
 static inline const char*
 write_type_tag(const as_transaction *tr)
 {
@@ -89,6 +124,11 @@ write_type_tag(const as_transaction *tr)
 			(as_transaction_is_udf(tr) ? "udf" : "write");
 }
 
+/*
+ * 记录唯一事务的详细日志（仅首次，不记录重试）。
+ * 对来自客户端或批量请求的事务，输出 namespace、digest、客户端地址及操作类型。
+ * 用于调试跟踪单条记录操作路径。
+ */
 static inline void
 detail_unique(const as_transaction *tr, bool is_write)
 {
@@ -115,9 +155,63 @@ detail_unique(const as_transaction *tr, bool is_write)
 //
 
 // Handle the transaction, including proxy to another node if necessary.
+// 单条数据事务的统一入口：XDR/Info 等特殊类型先处理；否则校验 namespace、权限、partition reserve，
+// 成功后根据 is_write/delete/udf/read_touch/re_repl 分发到 as_write_start、as_delete_start、as_read_start 等。
+//
+// 参数：
+//   tr - 待处理的事务结构体指针，包含消息体、来源、key digest 等信息
+/**
+ * 事务服务核心处理函数 - 单条记录事务的统一入口
+ *
+ * 功能描述：
+ * 这是 Aerospike 中所有单条记录事务的中央分发点，包括：
+ * - 客户端直接请求（FROM_CLIENT）
+ * - 批处理子请求（FROM_BATCH）
+ * - 代理转发请求（FROM_PROXY）
+ * - 内部操作请求（FROM_IUDF、FROM_IOPS 等）
+ *
+ * 主要处理流程：
+ * 1. 特殊事务类型：XDR 内部事务直接处理
+ * 2. 消息体初始化：设置事务的消息体信息
+ * 3. 安全认证检查：验证客户端连接权限
+ * 4. 命名空间解析：提取并验证目标命名空间
+ * 5. 集群状态检查：确保分区平衡已完成初始化
+ * 6. 事务类型分发：
+ *    - 查询事务（多记录）→ as_query()
+ *    - 单记录事务 → 进一步分类处理
+ * 7. 单记录事务处理：
+ *    - 超时检查：验证队列等待时间
+ *    - Key digest 提取：获取记录唯一标识
+ *    - 权限验证：检查操作权限
+ *    - 分区预留：预留读/写分区资源
+ *    - 操作分发：调用相应的处理函数
+ *
+ * 事务分发路径：
+ * - 写路径：delete → as_write_start/as_delete_start
+ * - UDF 路径：as_udf_start
+ * - 特殊路径：read_touch → as_read_touch_start
+ * - 复制路径：re_repl → as_re_replicate_start
+ * - 默认写路径：as_write_start
+ * - 读路径：as_read_start
+ *
+ * 分区管理：
+ * - 成功预留：事务继续处理，资源由后续模块管理
+ * - 预留失败：根据来源类型进行代理转发或错误处理
+ *
+ * 参数说明：
+ * @tr: 事务对象指针，包含消息、来源、状态等信息
+ *
+ * 资源管理：
+ * - 消息内存：根据事务状态决定是否释放
+ * - 分区预留：根据事务状态决定是否保持
+ * - 共享消息：批处理的共享消息不在此释放
+ */
+//
+// 函数执行后，tr 所有权由各子路径接管或在此函数末尾清理。
 void
 as_tsvc_process_transaction(as_transaction *tr)
 {
+	// 内部 XDR 类型消息（跨数据中心复制），走专用 xdr_read 路径，不经过常规事务流程。
 	if (tr->msgp->proto.type == PROTO_TYPE_INTERNAL_XDR) {
 		as_xdr_read(tr);
 		return;
@@ -128,9 +222,11 @@ as_tsvc_process_transaction(as_transaction *tr)
 	cl_msg *msgp = tr->msgp;
 	as_msg *m = &msgp->msg;
 
+	// 初始化事务体（msg_fields 标志位、result_code 等），与 head 分离初始化。
 	as_transaction_init_body(tr);
 
 	// Check that the socket is authenticated.
+	// 安全认证检查：仅客户端连接需要验证 socket 是否已通过认证。
 	if (tr->origin == FROM_CLIENT) {
 		uint8_t result = as_security_check_auth(tr->from.proto_fd_h);
 
@@ -142,6 +238,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 
 	// All transactions must have a namespace.
+	// 所有事务必须携带 namespace 字段，未携带则返回 AS_ERR_NAMESPACE。
 	as_msg_field *nf = as_msg_field_get(m, AS_MSG_FIELD_TYPE_NAMESPACE);
 
 	if (! nf) {
@@ -163,6 +260,8 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 
 	// Have we finished the very first partition balance?
+	// 检查初始 partition balance 是否已完成。
+	// 若尚未完成，代理请求退回发送方，其他请求返回 AS_ERR_UNAVAILABLE。
 	if (! as_partition_balance_is_init_resolved()) {
 		if (tr->origin == FROM_PROXY) {
 			as_proxy_return_to_sender(tr, ns);
@@ -203,6 +302,8 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	// Calculate end_time based on message transaction TTL. May be recalculating
 	// for re-queued transactions, but nice if end_time not copied on/off queue.
+	// 根据消息中的 transaction_ttl 计算事务截止时间（纳秒）。
+	// 若 ttl 为 0，则使用全局默认超时 g_config.transaction_max_ns。
 	if (m->transaction_ttl != 0) {
 		tr->end_time = tr->start_time +
 				((uint64_t)m->transaction_ttl * 1000000);
@@ -214,6 +315,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 
 	// Did the transaction time out while on the queue?
+	// 检查事务在队列中等待期间是否已超时，超时则返回 AS_ERR_TIMEOUT。
 	if (cf_getns() > tr->end_time) {
 		cf_debug(AS_TSVC, "transaction timed out in queue");
 		as_transaction_error(tr, ns, AS_ERR_TIMEOUT);
@@ -237,7 +339,9 @@ as_tsvc_process_transaction(as_transaction *tr)
 	// in the message - digest is already in tr.
 
 	// Process the transaction.
-
+	// 判断事务读写属性：
+	// - is_write=true 走写预留路径（同时可能带 READ 标志用于 read-modify-write）
+	// - is_read=true  走读预留路径
 	bool is_write = (m->info2 & AS_MSG_INFO2_WRITE) != 0;
 	bool is_read = (m->info1 & AS_MSG_INFO1_READ) != 0;
 	// Both can be set together, but is_write puts us on the 'write path' -
@@ -274,6 +378,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	if (rv == -2) {
 		// Partition is unavailable.
+		// partition 处于不可用状态（迁移中或节点故障），直接返回错误。
 		as_transaction_error(tr, ns, AS_ERR_UNAVAILABLE);
 		goto Cleanup;
 	}
@@ -284,11 +389,14 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	if (rv == 0) {
 		// <><><><><><>  Reservation Succeeded  <><><><><><>
+		// partition 预留成功，本节点是该 key 的 master，执行实际操作。
 
 		detail_unique(tr, is_write);
 
 		transaction_status status;
 
+		// 写路径分发：根据 delete/UDF/read_touch/re_repl 标志选择对应处理函数。
+		// 写路径：delete -> write/delete_start；UDF -> udf_start；read_touch -> read_touch_start；re_repl -> re_replicate_start；否则 as_write_start(tr)。
 		if (is_write) {
 			if (as_transaction_is_delete(tr)) {
 				status = convert_to_write(tr, &msgp) ?
@@ -315,14 +423,17 @@ as_tsvc_process_transaction(as_transaction *tr)
 		case TRANS_DONE_ERROR:
 		case TRANS_DONE_SUCCESS:
 			// Done, response already sent - free msg & release reservation.
+			// 事务已同步完成（成功或失败），响应已发送，释放 partition 预留。
 			as_partition_release(&tr->rsv);
 			break;
 		case TRANS_IN_PROGRESS:
 			// Don't free msg or release reservation - both owned by rw_request.
+			// 事务异步进行中（等待副本响应等），msgp 和 partition 预留由 rw_request 持有，此处不释放。
 			free_msgp = false;
 			break;
 		case TRANS_WAITING:
 			// Will be re-queued - don't free msg, but release reservation.
+			// 事务因 key 冲突进入等待队列，msgp 由等待元素持有，但 partition 预留需释放。
 			free_msgp = false;
 			as_partition_release(&tr->rsv);
 			break;
@@ -333,35 +444,43 @@ as_tsvc_process_transaction(as_transaction *tr)
 	}
 	else {
 		// <><><><><><>  Reservation Failed  <><><><><><>
+		// partition 预留失败：本节点不是该 key 的 master，需要将请求转发到目标节点。
+		// dest 是持有该 partition 的目标节点 ID。
 
 		switch (tr->origin) {
 		case FROM_CLIENT:
 		case FROM_BATCH:
+			// 客户端/批量请求：通过 fabric 代理转发到 dest 节点，msgp 由 fabric 接管。
 			as_proxy_divert(dest, tr, ns);
 			// CLIENT: fabric owns msgp, BATCH: it's shared, don't free it.
 			free_msgp = false;
 			break;
 		case FROM_PROXY:
+			// 已是代理请求但目标不对：退回原始发送方重新路由。
 			as_proxy_return_to_sender(tr, ns);
 			tr->from.proxy_node = 0; // pattern, not needed
 			break;
 		case FROM_IUDF:
+			// 内部 UDF 子事务：统计错误并通知调用方完成回调。
 			as_incr_uint64(&ns->n_udf_sub_tsvc_error);
 			tr->from.iudf_orig->done_cb(tr->from.iudf_orig->udata,
 					AS_ERR_UNKNOWN);
 			tr->from.iudf_orig = NULL; // pattern, not needed
 			break;
 		case FROM_IOPS:
+			// 内部 ops 子事务：统计错误并通知调用方完成回调。
 			as_incr_uint64(&ns->n_ops_sub_tsvc_error);
 			tr->from.iops_orig->done_cb(tr->from.iops_orig->udata,
 					AS_ERR_UNKNOWN);
 			tr->from.iops_orig = NULL; // pattern, not needed
 			break;
 		case FROM_READ_TOUCH:
+			// read-touch 内部事务失败，统计错误计数。
 			as_incr_uint64(&ns->n_read_touch_tsvc_error);
 			tr->from.read_touch_active = NULL; // pattern, not needed
 			break;
 		case FROM_RE_REPL:
+			// re-replicate 内部事务失败，调用原始回调通知上层。
 			as_incr_uint64(&ns->n_re_repl_tsvc_error);
 			tr->from.re_repl_orig_cb(tr);
 			tr->from.re_repl_orig_cb = NULL; // pattern, not needed

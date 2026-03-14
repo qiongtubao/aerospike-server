@@ -1,5 +1,14 @@
 /*
- * cf_thread.c
+ * cf_thread.c - 线程管理模块
+ *
+ * 功能描述：
+ * - 提供统一的线程创建和管理接口，支持多种线程模式
+ * - 实现线程池机制，提高短期任务的执行效率，减少线程创建开销
+ * - 支持分离式线程（detached）和可连接线程（joinable）两种模式
+ * - 提供线程统计信息和调试追踪功能，便于性能分析和问题诊断
+ * - 实现线程本地存储管理，支持自动内存清理和退出回调
+ * - 集成信号处理机制，支持线程栈回溯和运行状态监控
+ * - 确保线程安全的资源管理和优雅退出
  *
  * Copyright (C) 2018-2022 Aerospike, Inc.
  *
@@ -51,33 +60,38 @@
 // Typedefs & constants.
 //
 
+// 线程请求结构，用于线程池中的任务传递
 typedef struct thread_req_s {
-	cf_thread_run_fn run;
-	void* udata;
+	cf_thread_run_fn run;   // 要执行的函数指针
+	void* udata;            // 传递给执行函数的用户数据
 } thread_req;
 
+// 线程信息结构，维护每个线程的运行时信息和调试数据
 typedef struct thread_info_s {
-	cf_ll_element link; // base object must be first
-	cf_thread_run_fn run;
-	void* udata;
-	pid_t sys_tid;
-	uint32_t n_addrs;
-	void* addrs[MAX_BACKTRACE_DEPTH];
+	cf_ll_element link;                           // 链表元素（必须是第一个字段）
+	cf_thread_run_fn run;                        // 线程执行函数
+	void* udata;                                 // 用户数据指针
+	pid_t sys_tid;                               // 系统线程ID（用于信号发送）
+	uint32_t n_addrs;                            // 栈回溯地址数量
+	void* addrs[MAX_BACKTRACE_DEPTH];           // 栈回溯地址数组
 } thread_info;
 
+// 线程分配信息结构，用于线程本地内存管理
 typedef struct thread_alloc_s {
-	void** pp;
-	size_t* psz;
+	void** pp;      // 指向内存指针的指针
+	size_t* psz;    // 指向大小变量的指针
 } thread_alloc;
 
+// 线程退出回调结构
 typedef struct thread_exit_s {
-	cf_thread_exit_fn cb;
-	void* udata;
+	cf_thread_exit_fn cb;   // 退出回调函数
+	void* udata;            // 回调函数的用户数据
 } thread_exit;
 
+// 系统线程ID与执行函数的映射结构，用于调试查询
 typedef struct sys_tid_run_fn_s {
-	pid_t sys_tid;
-	cf_thread_run_fn run;
+	pid_t sys_tid;              // 系统线程ID
+	cf_thread_run_fn run;       // 对应的执行函数
 } sys_tid_run_fn;
 
 
@@ -85,29 +99,37 @@ typedef struct sys_tid_run_fn_s {
 // Globals.
 //
 
+// 线程本地存储：当前线程的系统线程ID
 __thread pid_t g_sys_tid = 0;
 
+// 分离式线程的pthread属性配置
 static pthread_attr_t g_attr_detached;
 
-static cf_queue g_thread_req_q;
-static cf_mutex g_pool_lock = CF_MUTEX_INIT;
+// 线程池任务队列和保护锁
+static cf_queue g_thread_req_q;                    // 任务请求队列
+static cf_mutex g_pool_lock = CF_MUTEX_INIT;       // 线程池操作互斥锁
 
-static uint32_t g_n_joinable = 0;
-static uint32_t g_n_detached = 0;
-static uint32_t g_n_pool_total = 0;
-static uint32_t g_n_pool_active = 0;
+// 线程统计计数器
+static uint32_t g_n_joinable = 0;      // 可连接线程数量
+static uint32_t g_n_detached = 0;      // 分离式线程数量
+static uint32_t g_n_pool_total = 0;    // 线程池总线程数
+static uint32_t g_n_pool_active = 0;   // 线程池活跃线程数
 
-static cf_ll g_thread_list;
-static __thread thread_info* g_thread_info;
+// 线程信息管理
+static cf_ll g_thread_list;                    // 所有线程信息的链表
+static __thread thread_info* g_thread_info;    // 线程本地存储：当前线程信息
 
-static uint32_t g_traces_pending;
-static uint32_t g_traces_done;
+// 线程调试追踪相关
+static uint32_t g_traces_pending;      // 等待栈回溯的线程数
+static uint32_t g_traces_done;         // 已完成栈回溯的线程数
 
-static __thread thread_alloc* g_allocs = NULL;
-static __thread uint32_t g_n_allocs = 0;
+// 线程本地内存管理
+static __thread thread_alloc* g_allocs = NULL; // 线程本地分配记录数组
+static __thread uint32_t g_n_allocs = 0;       // 分配记录数量
 
-static __thread thread_exit* g_exits = NULL;
-static __thread uint32_t g_n_exits = 0;
+// 线程本地退出回调管理
+static __thread thread_exit* g_exits = NULL;   // 退出回调数组
+static __thread uint32_t g_n_exits = 0;        // 退出回调数量
 
 
 //==========================================================
@@ -131,14 +153,23 @@ static void cleanup(void);
 // Public API.
 //
 
+// 初始化线程管理系统，设置全局配置和数据结构
+// 功能：
+//   - 配置分离式线程的pthread属性
+//   - 初始化线程池任务队列
+//   - 初始化线程信息管理链表
+// 线程安全性：必须在单线程环境下调用，通常在程序启动时执行
 void
 cf_thread_init(void)
 {
+	// 初始化分离式线程属性，设置为自动回收模式
 	pthread_attr_init(&g_attr_detached);
 	pthread_attr_setdetachstate(&g_attr_detached, PTHREAD_CREATE_DETACHED);
 
+	// 初始化线程池任务队列，支持8个初始槽位，启用阻塞模式
 	cf_queue_init(&g_thread_req_q, sizeof(thread_req), 8, true);
 
+	// 初始化线程信息链表，无删除回调，启用锁保护
 	cf_ll_init(&g_thread_list, NULL, true);
 }
 

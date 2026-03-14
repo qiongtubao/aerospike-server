@@ -46,6 +46,10 @@
 // Public API.
 //
 
+/*
+ * 计算一条记录以 as_flat_record 格式存储时的大小（不含 end_mark、不含 rblock 对齐）。
+ * 用于写前校验与预留空间。
+ */
 uint32_t
 as_flat_record_size(const as_storage_rd* rd)
 {
@@ -75,6 +79,10 @@ as_flat_record_size(const as_storage_rd* rd)
 	return write_sz;
 }
 
+/*
+ * 将 as_storage_rd 打包成设备上的 as_flat_record 格式：先写元数据（magic、keyd、generation、
+ * void_time、set、key、n_bins 等），再顺序写入各 bin（名长+名+可选 meta+粒子数据）。
+ */
 void
 as_flat_pack_record(const as_storage_rd* rd, uint32_t n_rblocks,
 		bool dirty, as_flat_record* flat)
@@ -438,6 +446,10 @@ flat_record_overhead_size(const as_storage_rd* rd)
 	return (uint32_t)size;
 }
 
+/*
+ * 将记录元数据写入 as_flat_record 头部：magic、n_rblocks、tree_id、keyd、时间与 generation、
+ * 可选 extra_flags、void_time、set 名、key、n_bins，以及压缩元数据；返回 data[] 的起始指针供 flatten_bins 写 bin。
+ */
 uint8_t*
 flatten_record_meta(const as_storage_rd* rd, uint32_t n_rblocks, bool dirty,
 		const as_flat_comp_meta* cm, as_flat_record* flat)
@@ -512,6 +524,10 @@ flatten_record_meta(const as_storage_rd* rd, uint32_t n_rblocks, bool dirty,
 	return flatten_compression_meta(cm, flat, at);
 }
 
+/*
+ * 将 rd->bins 按 flat 格式追加到 buf：每个 bin 为 [name_len][name][可选 meta][粒子 flat]，
+ * 与 as_flat_unpack_bins 对应，用于写入设备或复制到 pickle。
+ */
 void
 flatten_bins(const as_storage_rd* rd, uint8_t* buf, uint32_t* sz)
 {

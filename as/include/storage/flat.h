@@ -56,6 +56,7 @@ struct as_storage_rd_s;
 
 #define END_MARK_SZ 4 // not for pmem, only SSD
 
+// 设备上每条记录的固定头部格式，之后为 data[]（可选扩展标志、void_time、set、key、n_bins、压缩信息、各 bin 的 flat 数据）。
 // Per-record mandatory metadata on device.
 typedef struct as_flat_record_s {
 	uint32_t magic;

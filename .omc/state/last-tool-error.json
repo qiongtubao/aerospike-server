@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/Users/zhouguodong/Documents/github/aerospike-server/as/src/storage/drv_ssd.c\",\"offset\":2000,\"limit\":2703}",
+  "error": "File content (26028 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-03-14T22:25:10.728Z",
+  "retry_count": 1
+}

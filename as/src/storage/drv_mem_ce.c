@@ -70,6 +70,7 @@ as_storage_start_tomb_raider_mem(as_namespace* ns)
 int
 as_storage_record_write_mem(as_storage_rd* rd)
 {
+	// 纯删除（无 pickle 且无 bins）不写设备，由上层删索引；否则调用 write_record 写入内存/设备。
 	// No-op for drops, caller will drop record.
 	return rd->pickle != NULL || rd->n_bins != 0 ? write_record(rd) : 0;
 }

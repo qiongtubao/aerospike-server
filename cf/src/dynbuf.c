@@ -1,5 +1,13 @@
 /*
- * dynbuf.c
+ * dynbuf.c - 动态缓冲区管理模块
+ *
+ * 功能描述：
+ * - 提供自动扩展的动态缓冲区，支持高效的数据追加操作
+ * - 实现了多种数据类型的追加方法（字符串、数值、布尔值等）
+ * - 支持栈内存和堆内存两种分配策略，优化小缓冲区性能
+ * - 提供格式化输出功能，类似 sprintf 但更安全
+ * - 包含链式缓冲区（cf_ll_buf）和构建器模式（cf_buf_builder）
+ * - 专门针对信息输出场景优化，支持键值对格式化
  *
  * Copyright (C) 2008-2022 Aerospike, Inc.
  *
@@ -31,83 +39,139 @@
 #include <citrusleaf/alloc.h>
 
 
-#define MAX_BACKOFF (1024 * 256)
-#define MAX_FORMAT 100
+#define MAX_BACKOFF (1024 * 256)  // 最大回退分配大小，防止过度分配内存
+#define MAX_FORMAT 100             // 格式化字符串的最大长度限制
 
+// 计算新的缓冲区大小，采用分阶段回退策略以平衡内存使用和性能
+// 参数：
+//   alloc - 当前已分配的缓冲区大小
+//   used - 当前已使用的字节数
+//   requested - 本次请求的额外字节数
+// 返回值：
+//   计算得出的新缓冲区大小
+// 内存分配策略：
+//   - 小于8KB：以1KB为单位对齐，适合小数据快速分配
+//   - 8KB-32KB：以4KB为单位对齐，平衡内存碎片
+//   - 32KB-128KB：以32KB为单位对齐，减少大数据的重分配次数
+//   - 大于128KB：以256KB为单位对齐，优化大缓冲区性能
 size_t
 get_new_size(int alloc, int used, int requested)
 {
+	// 如果当前缓冲区剩余空间足够，直接返回当前大小
 	if (alloc - used > requested) {
 		return alloc;
 	}
 
+	// 计算基础新大小：当前大小 + 请求大小 + 结构体开销
 	size_t new_sz = alloc + requested + sizeof(cf_buf_builder);
 	int backoff;
 
+	// 根据缓冲区大小选择不同的对齐策略
 	if (new_sz < 1024 * 8) {
-		backoff = 1024;
+		backoff = 1024;        // 1KB对齐
 	}
 	else if (new_sz < 1024 * 32) {
-		backoff = 1024 * 4;
+		backoff = 1024 * 4;    // 4KB对齐
 	}
 	else if (new_sz < 1024 * 128) {
-		backoff = 1024 * 32;
+		backoff = 1024 * 32;   // 32KB对齐
 	}
 	else {
-		backoff = MAX_BACKOFF;
+		backoff = MAX_BACKOFF; // 256KB对齐
 	}
 
+	// 向上对齐到指定边界，减少内存碎片化
 	return new_sz + (backoff - (new_sz % backoff));
 }
 
+// 动态缓冲区内部扩容函数，处理栈内存到堆内存的转换
+// 参数：
+//   db - 动态缓冲区对象指针
+//   sz - 需要额外分配的字节数
+// 内存管理策略：
+//   - 如果是栈缓冲区且需要扩容，先分配堆内存并复制数据，然后标记为堆缓冲区
+//   - 如果已经是堆缓冲区，直接使用realloc扩容
+//   - 扩容大小通过get_new_size函数计算，采用对齐策略减少重分配频率
 void
 cf_dyn_buf_reserve_internal(cf_dyn_buf *db, size_t sz)
 {
+	// 计算新的缓冲区大小
 	size_t new_sz = get_new_size(db->alloc_sz, db->used_sz, sz);
 
+	// 只有当新大小确实大于当前分配大小时才进行扩容
 	if (new_sz > db->alloc_sz) {
 		uint8_t	*_t;
 
+		// 处理栈内存到堆内存的转换
 		if (db->is_stack) {
+			// 分配新的堆内存
 			_t = cf_malloc(new_sz);
+			// 复制现有数据到新内存
 			memcpy(_t, db->buf, db->used_sz);
+			// 标记为堆缓冲区
 			db->is_stack = false;
 		}
 		else {
+			// 已经是堆缓冲区，直接重新分配
 			_t = cf_realloc(db->buf, new_sz);
 		}
 
+		// 更新缓冲区指针和大小
 		db->buf = _t;
 		db->alloc_sz = new_sz;
 	}
 }
 
+// 缓冲区空间检查和预留宏，如果空间不足则自动扩容
+// 参数 _n：需要的额外字节数
 #define DB_RESERVE(_n) \
 	if (db->alloc_sz - db->used_sz < _n) { \
 		cf_dyn_buf_reserve_internal(db, _n); \
 	}
 
+// 初始化堆内存动态缓冲区
+// 参数：
+//   db - 要初始化的动态缓冲区对象
+//   sz - 初始分配的缓冲区大小
+// 功能：直接在堆上分配指定大小的内存，适合长期使用的缓冲区
 void
 cf_dyn_buf_init_heap(cf_dyn_buf *db, size_t sz)
 {
-	db->buf = cf_malloc(sz);
-	db->is_stack = false;
-	db->alloc_sz = sz;
-	db->used_sz = 0;
+	db->buf = cf_malloc(sz);        // 在堆上分配内存
+	db->is_stack = false;           // 标记为堆缓冲区
+	db->alloc_sz = sz;              // 设置分配大小
+	db->used_sz = 0;                // 初始使用大小为0
 }
 
+// 预留指定大小的缓冲区空间，并返回写入位置指针
+// 参数：
+//   db - 动态缓冲区对象
+//   sz - 要预留的字节数
+//   from - 输出参数，返回可写入数据的起始位置指针（可为NULL）
+// 功能：
+//   - 确保缓冲区有足够空间容纳sz字节数据
+//   - 更新已使用大小，相当于"占位"操作
+//   - 调用者需要自行向返回的指针位置写入数据
 void
 cf_dyn_buf_reserve(cf_dyn_buf *db, size_t sz, uint8_t **from)
 {
 	DB_RESERVE(sz);
 
+	// 如果需要返回写入位置，设置为当前缓冲区末尾
 	if (from) {
 		*from = &db->buf[db->used_sz];
 	}
 
+	// 更新已使用大小（预先占位）
 	db->used_sz += sz;
 }
 
+// 向动态缓冲区追加二进制数据
+// 参数：
+//   db - 动态缓冲区对象
+//   buf - 要追加的数据缓冲区
+//   sz - 数据大小（字节数）
+// 功能：将指定长度的二进制数据复制到缓冲区末尾
 void
 cf_dyn_buf_append_buf(cf_dyn_buf *db, const uint8_t *buf, size_t sz)
 {
@@ -116,6 +180,11 @@ cf_dyn_buf_append_buf(cf_dyn_buf *db, const uint8_t *buf, size_t sz)
 	db->used_sz += sz;
 }
 
+// 向动态缓冲区追加字符串
+// 参数：
+//   db - 动态缓冲区对象
+//   s - 要追加的C字符串（以'\0'结尾）
+// 功能：将字符串内容（不包括结尾的'\0'）追加到缓冲区
 void
 cf_dyn_buf_append_string(cf_dyn_buf *db, const char *s)
 {
@@ -126,6 +195,10 @@ cf_dyn_buf_append_string(cf_dyn_buf *db, const char *s)
 	db->used_sz += len;
 }
 
+// 向动态缓冲区追加单个字符
+// 参数：
+//   db - 动态缓冲区对象
+//   c - 要追加的字符
 void
 cf_dyn_buf_append_char(cf_dyn_buf *db, char c)
 {
@@ -134,6 +207,11 @@ cf_dyn_buf_append_char(cf_dyn_buf *db, char c)
 	db->used_sz++;
 }
 
+// 向动态缓冲区追加布尔值的字符串表示
+// 参数：
+//   db - 动态缓冲区对象
+//   b - 布尔值
+// 功能：追加"true"或"false"字符串
 void
 cf_dyn_buf_append_bool(cf_dyn_buf *db, bool b)
 {

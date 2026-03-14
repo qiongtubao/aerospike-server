@@ -20,6 +20,36 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/
  */
 
+/**
+ * ======================================================
+ * 集合索引模块 (Set Index Module)
+ * ======================================================
+ *
+ * 本模块实现了Aerospike数据库的集合索引系统，为每个集合（Set）提供
+ * 独立的索引结构，支持按集合进行高效的记录查询和遍历操作。
+ *
+ * 核心设计特点：
+ * - 分层索引架构：在主索引之上构建集合索引，实现快速的集合过滤
+ * - 独立红黑树：每个集合维护独立的红黑树，减少跨集合操作的开销
+ * - 微型arena管理：使用轻量级的uarena进行内存管理，优化小对象分配
+ * - 异步填充：支持在线启用集合索引，后台异步填充现有记录
+ *
+ * 索引结构层次：
+ * 1. as_set_index_tree: 集合索引树的顶层结构
+ * 2. ssprig: 集合索引分片，将记录按摘要分布到不同的红黑树
+ * 3. index_ele: 集合索引元素，存储记录句柄和摘要片段
+ *
+ * 内存管理策略：
+ * - uarena: 微型arena，专为小对象（index_ele）设计的内存管理器
+ * - stage机制: 按固定大小的stage分配内存，支持快速分配和释放
+ * - 自由列表: 维护已释放对象的链表，支持内存重用
+ *
+ * 并发控制：
+ * - 复用主索引的锁机制，每个ssprig与对应的主索引sprig共享锁
+ * - 平衡锁：全局平衡锁保护集合索引的创建和销毁操作
+ * - 引用计数：集合索引树使用引用计数管理生命周期
+ */
+
 //==========================================================
 // Includes.
 //
@@ -50,47 +80,69 @@
 
 
 //==========================================================
-// Typedefs & constants.
+// 类型定义和常量 (Typedefs & constants)
 //
 
+/**
+ * 栈元素结构 - 用于红黑树操作时保存父子关系
+ * 在集合索引树的插入、删除和重平衡操作中，需要追踪从根到目标节点的路径
+ */
 typedef struct stack_ele_s {
-	struct stack_ele_s* parent;
-	uarena_handle me_h;
-	index_ele* me;
+	struct stack_ele_s* parent;  // 指向父节点的栈元素
+	uarena_handle me_h;          // 当前节点的微型arena句柄
+	index_ele* me;               // 指向当前索引元素的指针
 } stack_ele;
 
+/**
+ * 填充信息结构 - 用于异步填充集合索引
+ * 当启用集合索引时，需要遍历现有记录并将其添加到集合索引中
+ */
 typedef struct populate_info_s {
-	as_namespace* ns;
-	as_set* p_set;
-	uint16_t set_id;
-	uint32_t pid;
+	as_namespace* ns;    // 命名空间指针
+	as_set* p_set;       // 集合指针
+	uint16_t set_id;     // 集合ID
+	uint32_t pid;        // 分区ID（原子递增，用于工作分配）
 } populate_info;
 
+/**
+ * 填充回调信息结构 - 传递给填充回调函数的上下文
+ * 包含填充过程中需要的所有上下文信息
+ */
 typedef struct populate_cb_info_s {
-	as_namespace* ns;
-	as_set* p_set;
-	uint16_t set_id;
-	as_index_tree* tree;
-	as_set_index_tree* stree;
+	as_namespace* ns;           // 命名空间指针
+	as_set* p_set;              // 集合指针
+	uint16_t set_id;            // 集合ID
+	as_index_tree* tree;        // 主索引树
+	as_set_index_tree* stree;   // 集合索引树
 } populate_cb_info;
 
-#define N_POPULATE_THREADS 4
+#define N_POPULATE_THREADS 4  // 并行填充的线程数量
 
 //--------------------------------------
-// uarena constants.
+// uarena常量 (uarena constants)
 //
 
-#define STAGES_STEP 8
-#define STAGE_CAPACITY (1 << ELE_ID_N_BITS) // 256
-#define STAGE_SIZE (STAGE_CAPACITY * ELE_SIZE) // 4K
+#define STAGES_STEP 8                           // stage扩展步长
+#define STAGE_CAPACITY (1 << ELE_ID_N_BITS)     // 每个stage的容量 (256)
+#define STAGE_SIZE (STAGE_CAPACITY * ELE_SIZE)  // 每个stage的大小 (4K)
 
 
 //==========================================================
-// Globals.
+// 全局变量 (Globals)
 //
 
+/**
+ * 全局平衡锁
+ * 保护集合索引的创建和销毁操作，确保与rebalance操作不冲突
+ * 在启用/禁用集合索引时需要获取此锁，避免竞态条件
+ */
 cf_mutex g_balance_lock = CF_MUTEX_INIT;
 
+/**
+ * 全局填充队列
+ * 存储待填充的集合索引信息，由专门的填充线程处理
+ * 当启用集合索引时，将填充任务加入此队列异步处理
+ */
 static cf_queue g_populate_q;
 
 
@@ -154,9 +206,17 @@ uarena_set_handle(uarena_handle* h, uint32_t stage_id, uint32_t ele_id)
 
 
 //==========================================================
-// Public API - startup.
+// 公共API - 启动 (Public API - startup)
 //
 
+/**
+ * 初始化集合索引系统
+ *
+ * 功能说明：
+ * 1. 初始化全局填充队列，容量为4个填充任务
+ * 2. 创建填充队列处理线程，负责异步处理集合索引的填充任务
+ * 3. 系统启动时调用一次，准备集合索引的基础设施
+ */
 void
 as_set_index_init(void)
 {
@@ -167,10 +227,21 @@ as_set_index_init(void)
 
 
 //==========================================================
-// Public API - set-index tree lifecycle.
+// 公共API - 集合索引树生命周期 (Public API - set-index tree lifecycle)
 //
 
-// May be under partition lock.
+/**
+ * 为所有启用索引的集合创建集合索引树
+ * 在分区锁保护下可能被调用
+ *
+ * @param ns 命名空间指针
+ * @param tree 主索引树指针
+ *
+ * 功能说明：
+ * 1. 遍历命名空间中的所有集合
+ * 2. 为每个启用索引的集合创建对应的集合索引树
+ * 3. 通常在分区初始化或rebalance时调用
+ */
 void
 as_set_index_create_all(as_namespace* ns, as_index_tree* tree)
 {
@@ -183,6 +254,17 @@ as_set_index_create_all(as_namespace* ns, as_index_tree* tree)
 	}
 }
 
+/**
+ * 销毁索引树中的所有集合索引树
+ *
+ * @param tree 主索引树指针
+ *
+ * 功能说明：
+ * 1. 遍历所有可能的集合索引树
+ * 2. 验证引用计数并直接销毁每个集合索引树
+ * 3. 销毁集合索引树锁
+ * 4. 通常在主索引树销毁时调用
+ */
 void
 as_set_index_destroy_all(as_index_tree* tree)
 {
@@ -190,23 +272,45 @@ as_set_index_destroy_all(as_index_tree* tree)
 		as_set_index_tree* stree = tree->set_trees[set_id];
 
 		if (stree != NULL) {
-			// TODO - paranoia - remove or simplify eventually.
+			// TODO - 偏执检查 - 最终可能会移除或简化
 			uint32_t rc = cf_rc_count(stree);
 			cf_assert(rc == 1, AS_INDEX, "bad stree rc %u id %u", rc, set_id);
 
-			stree_destroy(stree); // ok to directly destroy stree
+			stree_destroy(stree); // 可以直接销毁stree
 		}
 	}
 
 	cf_mutex_destroy(&tree->set_trees_lock);
 }
 
+/**
+ * 为指定集合创建集合索引树
+ *
+ * @param tree 主索引树指针
+ * @param set_id 集合ID
+ *
+ * 功能说明：
+ * - 创建新的集合索引树并关联到主索引树
+ * - 通常在动态启用集合索引时调用
+ */
 void
 as_set_index_tree_create(as_index_tree* tree, uint16_t set_id)
 {
 	tree->set_trees[set_id] = stree_create();
 }
 
+/**
+ * 销毁指定集合的集合索引树
+ *
+ * @param tree 主索引树指针
+ * @param set_id 集合ID
+ *
+ * 功能说明：
+ * 1. 获取集合索引树锁，确保线程安全
+ * 2. 将集合索引树从主索引树中移除
+ * 3. 释放集合索引树的引用计数
+ * 4. 如果引用计数降到0，集合索引树将被自动销毁
+ */
 void
 as_set_index_tree_destroy(as_index_tree* tree, uint16_t set_id)
 {
@@ -220,12 +324,27 @@ as_set_index_tree_destroy(as_index_tree* tree, uint16_t set_id)
 	cf_mutex_unlock(&tree->set_trees_lock);
 }
 
+/**
+ * 获取全局平衡锁
+ *
+ * 功能说明：
+ * - 保护集合索引的创建和销毁操作
+ * - 确保与rebalance操作不冲突
+ * - 必须与as_set_index_balance_unlock配对使用
+ */
 void
 as_set_index_balance_lock(void)
 {
 	cf_mutex_lock(&g_balance_lock);
 }
 
+/**
+ * 释放全局平衡锁
+ *
+ * 功能说明：
+ * - 释放由as_set_index_balance_lock获取的锁
+ * - 允许其他线程进行集合索引操作
+ */
 void
 as_set_index_balance_unlock(void)
 {
@@ -234,9 +353,24 @@ as_set_index_balance_unlock(void)
 
 
 //==========================================================
-// Public API - transactions.
+// 公共API - 事务处理 (Public API - transactions)
 //
 
+/**
+ * 将记录插入到集合索引中
+ *
+ * @param ns 命名空间指针
+ * @param tree 主索引树指针
+ * @param set_id 集合ID
+ * @param r_h 记录在arena中的句柄
+ *
+ * 功能说明：
+ * 1. 检查集合是否启用了索引，未启用则直接返回
+ * 2. 获取集合索引树的引用，确保在操作期间不被销毁
+ * 3. 根据记录摘要确定应插入的ssprig位置
+ * 4. 执行实际的插入操作
+ * 5. 释放集合索引树引用
+ */
 void
 as_set_index_insert(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		uint64_t r_h)
@@ -245,17 +379,21 @@ as_set_index_insert(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		return;
 	}
 
+	// 获取集合索引树引用，确保操作期间的稳定性
 	as_set_index_tree* stree = stree_reserve(tree, set_id);
 
 	if (stree == NULL) {
 		return;
 	}
 
+	// 解析记录指针，获取记录摘要
 	as_index* r = cf_arenax_resolve(tree->shared->arena, r_h);
 	ssprig_info ssi;
 
+	// 根据记录摘要初始化ssprig信息
 	ssi_from_keyd(tree, stree, &r->keyd, &ssi);
 
+	// 插入记录到对应的ssprig
 	if (! ssprig_insert(&ssi, r_h)) {
 		cf_warning(AS_INDEX, "insert found existing element - unexpected");
 	}
@@ -263,6 +401,21 @@ as_set_index_insert(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 	stree_release(stree);
 }
 
+/**
+ * 从集合索引中删除记录
+ *
+ * @param ns 命名空间指针
+ * @param tree 主索引树指针
+ * @param set_id 集合ID
+ * @param r_h 记录在arena中的句柄
+ *
+ * 功能说明：
+ * 1. 检查集合是否启用了索引，未启用则直接返回
+ * 2. 获取集合索引树的引用
+ * 3. 根据记录摘要定位到对应的ssprig
+ * 4. 从ssprig中删除记录
+ * 5. 释放集合索引树引用
+ */
 void
 as_set_index_delete(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		uint64_t r_h)
@@ -271,21 +424,36 @@ as_set_index_delete(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		return;
 	}
 
+	// 获取集合索引树引用
 	as_set_index_tree* stree = stree_reserve(tree, set_id);
 
 	if (stree == NULL) {
 		return;
 	}
 
+	// 解析记录指针，获取记录摘要
 	as_index* r = cf_arenax_resolve(tree->shared->arena, r_h);
 	ssprig_info ssi;
 
+	// 根据记录摘要初始化ssprig信息并执行删除
 	ssi_from_keyd(tree, stree, &r->keyd, &ssi);
 	ssprig_delete(&ssi);
 
 	stree_release(stree);
 }
 
+/**
+ * 删除活跃记录的集合索引
+ *
+ * @param ns 命名空间指针
+ * @param tree 主索引树指针
+ * @param r 记录指针
+ * @param r_h 记录在arena中的句柄
+ *
+ * 功能说明：
+ * - 检查记录是否为活跃状态，如果是则从集合索引中删除
+ * - 用于记录过期或删除时的清理工作
+ */
 void
 as_set_index_delete_live(as_namespace* ns, as_index_tree* tree, as_record* r,
 		uint64_t r_h)
@@ -295,6 +463,25 @@ as_set_index_delete_live(as_namespace* ns, as_index_tree* tree, as_record* r,
 	}
 }
 
+/**
+ * 遍历指定集合的所有记录
+ *
+ * @param ns 命名空间指针
+ * @param tree 主索引树指针
+ * @param set_id 集合ID
+ * @param keyd 起始边界摘要，NULL表示从头开始
+ * @param cb 回调函数指针
+ * @param udata 传递给回调函数的用户数据
+ * @return true表示成功启动遍历，false表示集合未准备好或操作失败
+ *
+ * 功能说明：
+ * 1. 检查集合索引是否已填充完成
+ * 2. 获取集合索引树引用
+ * 3. 确定遍历起始点（ssprig和摘要片段）
+ * 4. 从起始ssprig开始倒序遍历所有ssprig
+ * 5. 根据puddle配置选择适当的遍历策略
+ * 6. 释放集合索引树引用
+ */
 bool
 as_set_index_reduce(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		cf_digest* keyd, as_index_reduce_fn cb, void* udata)
@@ -303,6 +490,7 @@ as_set_index_reduce(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		return false;
 	}
 
+	// 获取集合索引树引用
 	as_set_index_tree* stree = stree_reserve(tree, set_id);
 
 	if (stree == NULL) {
@@ -312,17 +500,19 @@ as_set_index_reduce(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 	uint32_t start_sprig_i;
 	uint32_t keyd_stub;
 
+	// 确定遍历起始点
 	if (keyd == NULL) {
-		start_sprig_i = N_SET_SPRIGS - 1;
+		start_sprig_i = N_SET_SPRIGS - 1;  // 从最后一个ssprig开始
 		keyd_stub = 0;
 	}
 	else {
-		start_sprig_i = ssprig_i_from_keyd(keyd);
-		keyd_stub = stub_from_keyd(keyd);
+		start_sprig_i = ssprig_i_from_keyd(keyd);  // 根据摘要确定起始ssprig
+		keyd_stub = stub_from_keyd(keyd);          // 提取摘要片段
 	}
 
+	// 倒序遍历所有ssprig
 	for (int i = (int)start_sprig_i; i >= 0; i--, keyd = NULL) {
-		// Very common to encounter empty sprigs - check optimistically.
+		// 优化：跳过空的ssprig（非常常见）
 		if (stree->roots[i] == SENTINEL_H) {
 			continue;
 		}
@@ -330,14 +520,17 @@ as_set_index_reduce(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 		ssprig_reduce_info ssri;
 		ssri_from_ssprig_i(tree, stree, keyd, keyd_stub, (uint32_t)i, &ssri);
 
+		// 根据puddle配置选择遍历策略
 		if (tree->shared->puddles_offset == 0) {
+			// 无puddle：使用标准引用计数遍历
 			if (! ssprig_reduce(&ssri, cb, udata)) {
-				break; // don't care why it finished reducing
+				break; // 不关心为什么结束遍历
 			}
 		}
 		else {
+			// 有puddle：使用无引用计数的优化遍历
 			if (! ssprig_reduce_no_rc(tree, &ssri, cb, udata)) {
-				break; // don't care why it finished reducing
+				break; // 不关心为什么结束遍历
 			}
 		}
 	}
@@ -349,9 +542,23 @@ as_set_index_reduce(as_namespace* ns, as_index_tree* tree, uint16_t set_id,
 
 
 //==========================================================
-// Public API - info & stats.
+// 公共API - 信息和统计 (Public API - info & stats)
 //
 
+/**
+ * 启用指定集合的索引功能
+ *
+ * @param ns 命名空间指针
+ * @param p_set 集合指针
+ * @param set_id 集合ID
+ *
+ * 功能说明：
+ * 1. 检查集合索引是否已启用，避免重复启用
+ * 2. 获取全局平衡锁，确保与rebalance操作同步
+ * 3. 为所有分区创建集合索引结构
+ * 4. 标记集合索引为填充状态并启用
+ * 5. 如果集合为空，直接完成；否则启动异步填充
+ */
 void
 as_set_index_enable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 {
@@ -359,20 +566,24 @@ as_set_index_enable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 		return;
 	}
 
-	// Ensure either rebalance or this call creates the strees.
+	// 确保rebalance或此调用创建stree
 	cf_mutex_lock(&g_balance_lock);
 
+	// 为所有分区创建集合索引
 	for (uint32_t pid = 0; pid < AS_PARTITIONS; pid++) {
 		as_partition_create_set_index(ns, pid, set_id);
 	}
 
+	// 标记为正在填充并启用索引（使用release语义确保可见性）
 	p_set->index_populating = true;
 	as_store_bool_rls(&p_set->index_enabled, true);
 
 	cf_mutex_unlock(&g_balance_lock);
 
+	// 内存屏障确保上述操作的可见性
 	as_fence_seq();
 
+	// 如果集合为空，直接完成
 	if (p_set->n_objects == 0) {
 		p_set->index_populating = false;
 
@@ -382,6 +593,7 @@ as_set_index_enable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 		return;
 	}
 
+	// 准备填充信息并加入队列
 	populate_info popi = {
 			.ns = ns,
 			.p_set = p_set,
@@ -391,6 +603,20 @@ as_set_index_enable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 	cf_queue_push(&g_populate_q, &popi);
 }
 
+/**
+ * 禁用指定集合的索引功能
+ *
+ * @param ns 命名空间指针
+ * @param p_set 集合指针
+ * @param set_id 集合ID
+ *
+ * 功能说明：
+ * 1. 检查集合索引是否已启用，未启用则直接返回
+ * 2. 获取全局平衡锁，确保与rebalance操作同步
+ * 3. 禁用集合索引并销毁所有分区的集合索引结构
+ * 4. 从填充队列中移除可能存在的填充任务
+ * 5. 等待正在进行的填充操作完成
+ */
 void
 as_set_index_disable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 {
@@ -398,26 +624,40 @@ as_set_index_disable(as_namespace* ns, as_set* p_set, uint16_t set_id)
 		return;
 	}
 
-	// Ensure rebalance won't set NULL strees - destroy assumes they're not.
+	// 确保rebalance不会设置NULL stree - destroy假设它们不是NULL
 	cf_mutex_lock(&g_balance_lock);
 
+	// 禁用索引标志
 	p_set->index_enabled = false;
 
+	// 销毁所有分区的集合索引
 	for (uint32_t pid = 0; pid < AS_PARTITIONS; pid++) {
 		as_partition_destroy_set_index(ns, pid, set_id);
 	}
 
 	cf_mutex_unlock(&g_balance_lock);
 
-	// If it's still queued to be enabled, remove it from the queue.
+	// 如果还在队列中等待启用，从队列中移除
 	cf_queue_reduce(&g_populate_q, populate_q_reduce_cb, p_set);
 
-	// If we cancelled, ensure cancellation is done (in case we repopulate).
+	// 如果取消了填充，确保取消完成（以便我们可以重新填充）
 	while (p_set->index_populating) {
 		usleep(100);
 	}
 }
 
+/**
+ * 计算集合索引使用的字节数
+ *
+ * @param ns 命名空间指针
+ * @return 集合索引总共使用的字节数
+ *
+ * 功能说明：
+ * 1. 遍历命名空间中的所有集合
+ * 2. 统计启用了索引的集合中的对象总数
+ * 3. 根据index_ele的大小计算总内存使用量
+ * 4. 用于监控和容量规划
+ */
 uint64_t
 as_set_index_used_bytes(const as_namespace* ns)
 {
@@ -427,24 +667,40 @@ as_set_index_used_bytes(const as_namespace* ns)
 	for (uint32_t set_ix = 0; set_ix < n_sets; set_ix++) {
 		as_set* p_set;
 
+		// 从vmap中获取集合指针
 		if (cf_vmapx_get_by_index(ns->p_sets_vmap, set_ix, (void**)&p_set) !=
 				CF_VMAPX_OK) {
 			cf_crash(AS_INDEX, "failed to get set index %u from vmap", set_ix);
 		}
 
+		// 只统计启用了索引的集合
 		if (p_set->index_enabled) {
 			n_objects += p_set->n_objects;
 		}
 	}
 
+	// 返回总内存使用量（对象数 × 索引元素大小）
 	return n_objects * sizeof(index_ele);
 }
 
 
 //==========================================================
-// Local helpers - configuration.
+// 本地辅助函数 - 配置 (Local helpers - configuration)
 //
 
+/**
+ * 检查指定集合是否启用了索引
+ *
+ * @param ns 命名空间指针
+ * @param set_id 集合ID
+ * @return true表示集合启用了索引，false表示未启用
+ *
+ * 功能说明：
+ * 1. 检查集合ID的有效性
+ * 2. 从命名空间的集合映射中获取集合指针
+ * 3. 使用内存屏障确保读取操作的可见性
+ * 4. 返回集合的索引启用状态
+ */
 static inline bool
 is_set_indexed(const as_namespace* ns, uint16_t set_id)
 {
@@ -452,19 +708,34 @@ is_set_indexed(const as_namespace* ns, uint16_t set_id)
 		return false;
 	}
 
-	uint32_t set_ix = (uint32_t)(set_id - 1);
+	uint32_t set_ix = (uint32_t)(set_id - 1);  // 集合索引从0开始
 	as_set* p_set;
 
+	// 从vmap中获取集合指针
 	if (cf_vmapx_get_by_index(ns->p_sets_vmap, set_ix, (void**)&p_set) !=
 			CF_VMAPX_OK) {
 		cf_crash(AS_INDEX, "failed to get set index %u from vmap", set_ix);
 	}
 
+	// 内存屏障确保读取的一致性
 	as_fence_seq();
 
 	return p_set->index_enabled;
 }
 
+/**
+ * 检查指定集合的索引是否已填充完成
+ *
+ * @param ns 命名空间指针
+ * @param set_id 集合ID
+ * @return true表示集合索引已填充完成，false表示未完成或未启用
+ *
+ * 功能说明：
+ * 1. 检查集合ID的有效性
+ * 2. 从命名空间的集合映射中获取集合指针
+ * 3. 检查集合索引是否启用且填充完成
+ * 4. 使用acquire语义确保读取操作的正确性
+ */
 static inline bool
 is_set_populated(const as_namespace* ns, uint16_t set_id)
 {
@@ -472,14 +743,16 @@ is_set_populated(const as_namespace* ns, uint16_t set_id)
 		return false;
 	}
 
-	uint32_t set_ix = (uint32_t)(set_id - 1);
+	uint32_t set_ix = (uint32_t)(set_id - 1);  // 集合索引从0开始
 	as_set* p_set;
 
+	// 从vmap中获取集合指针
 	if (cf_vmapx_get_by_index(ns->p_sets_vmap, set_ix, (void**)&p_set) !=
 			CF_VMAPX_OK) {
 		cf_crash(AS_INDEX, "failed to get set index %u from vmap", set_ix);
 	}
 
+	// 使用acquire语义读取索引启用状态，并检查是否填充完成
 	return as_load_bool_acq(&p_set->index_enabled) && ! p_set->index_populating;
 }
 
@@ -1365,9 +1638,20 @@ rotate_right(stack_ele* a, stack_ele* b)
 
 
 //==========================================================
-// uarena API.
+// 微型Arena API (uarena API)
 //
 
+/**
+ * 初始化微型arena
+ *
+ * @param ua 微型arena指针
+ *
+ * 功能说明：
+ * 1. 初始化arena的锁，保证线程安全的分配和释放
+ * 2. 添加第一个内存stage，准备进行内存分配
+ * 3. 设置分配指针从ID 1开始（ID 0保留为sentinel）
+ * 4. 清零sentinel位置，作为无效句柄的标识
+ */
 static void
 uarena_init(uarena* ua)
 {
@@ -1375,34 +1659,75 @@ uarena_init(uarena* ua)
 
 	uarena_add_stage(ua);
 
-	ua->at_ele_id = 1;
-	memset(uarena_resolve(ua, 0), 0, ELE_SIZE);
+	ua->at_ele_id = 1;  // ID 0保留为sentinel
+	memset(uarena_resolve(ua, 0), 0, ELE_SIZE);  // 清零sentinel元素
 }
 
+/**
+ * 销毁微型arena及其所有资源
+ *
+ * @param ua 微型arena指针
+ *
+ * 功能说明：
+ * 1. 释放所有已分配的内存stage
+ * 2. 释放stage指针数组
+ * 3. 销毁arena锁
+ * 4. 确保没有内存泄漏
+ */
 static void
 uarena_destroy(uarena* ua)
 {
+	// 释放所有stage的内存
 	for (uint32_t i = 0; i < ua->n_stages; i++) {
 		cf_free(ua->stages[i]);
 	}
 
+	// 释放stage指针数组
 	cf_free(ua->stages);
+
+	// 销毁锁
 	cf_mutex_destroy(&ua->lock);
 }
 
+/**
+ * 向微型arena添加新的内存stage
+ *
+ * @param ua 微型arena指针
+ *
+ * 功能说明：
+ * 1. 分配新的固定大小内存块（4KB）
+ * 2. 按需扩展stage指针数组（每次扩展8个指针）
+ * 3. 将新stage添加到arena中，增加可用内存容量
+ */
 static void
 uarena_add_stage(uarena* ua)
 {
+	// 分配固定大小的内存stage
 	uint8_t* stage = cf_malloc(STAGE_SIZE);
 
+	// 按需扩展stage指针数组
 	if (ua->n_stages % STAGES_STEP == 0) {
 		ua->stages = realloc(ua->stages,
 				(ua->n_stages + STAGES_STEP) * sizeof(uint8_t*));
 	}
 
+	// 添加新stage到数组
 	ua->stages[ua->n_stages++] = stage;
 }
 
+/**
+ * 从微型arena分配一个元素
+ *
+ * @param ua 微型arena指针
+ * @return 分配的元素句柄，0表示分配失败
+ *
+ * 功能说明：
+ * 1. 线程安全地分配单个index_ele大小的内存
+ * 2. 优先从自由列表中重用已释放的元素
+ * 3. 如果自由列表为空，则从当前stage的末尾分配
+ * 4. 如果当前stage已满，自动添加新stage
+ * 5. 返回可用于后续解析的句柄
+ */
 static uarena_handle
 uarena_alloc(uarena* ua)
 {
@@ -1410,19 +1735,21 @@ uarena_alloc(uarena* ua)
 
 	uarena_handle h;
 
-	// Check free list first.
+	// 优先检查自由列表
 	if (ua->free_h != 0) {
 		h = ua->free_h;
-		ua->free_h = NEXT_FREE_H(ua, h);
+		ua->free_h = NEXT_FREE_H(ua, h);  // 获取下一个自由元素
 	}
-	// Otherwise keep end-allocating.
+	// 否则从当前stage末尾分配
 	else {
+		// 如果当前stage已满，添加新stage
 		if (ua->at_ele_id >= STAGE_CAPACITY) {
 			uarena_add_stage(ua);
 			ua->at_stage_id++;
 			ua->at_ele_id = 0;
 		}
 
+		// 构造新的句柄并移动分配指针
 		uarena_set_handle(&h, ua->at_stage_id, ua->at_ele_id);
 		ua->at_ele_id++;
 	}
@@ -1432,11 +1759,24 @@ uarena_alloc(uarena* ua)
 	return h;
 }
 
+/**
+ * 释放微型arena中的元素
+ *
+ * @param ua 微型arena指针
+ * @param h 要释放的元素句柄
+ *
+ * 功能说明：
+ * 1. 线程安全地将元素添加到自由列表
+ * 2. 使用链表结构管理自由元素
+ * 3. 支持内存重用，提高分配效率
+ * 4. 不实际释放内存，而是标记为可重用
+ */
 static void
 uarena_free(uarena* ua, uarena_handle h)
 {
 	cf_mutex_lock(&ua->lock);
 
+	// 将释放的元素链接到自由列表头部
 	NEXT_FREE_H(ua, h) = ua->free_h;
 	ua->free_h = h;
 

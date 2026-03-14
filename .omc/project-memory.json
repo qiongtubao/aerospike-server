@@ -1,0 +1,350 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1773525256313,
+  "projectRoot": "/Users/zhouguodong/Documents/github/aerospike-server",
+  "techStack": {
+    "languages": [
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "make build",
+    "testCommand": "make test",
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "bin",
+      "docs"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "apidocs": {
+      "path": "apidocs",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1773525256296,
+      "keyFiles": [
+        "Makefile"
+      ]
+    },
+    "as": {
+      "path": "as",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1773525256297,
+      "keyFiles": [
+        "Makefile"
+      ]
+    },
+    "bin": {
+      "path": "bin",
+      "purpose": "Executable scripts",
+      "fileCount": 1,
+      "lastAccessed": 1773525256297,
+      "keyFiles": [
+        "install-dependencies.sh"
+      ]
+    },
+    "build": {
+      "path": "build",
+      "purpose": "Build output",
+      "fileCount": 4,
+      "lastAccessed": 1773525256297,
+      "keyFiles": [
+        "gen_version",
+        "os_version",
+        "version",
+        "versioncheck"
+      ]
+    },
+    "cf": {
+      "path": "cf",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1773525256297,
+      "keyFiles": [
+        "Makefile",
+        "README.md"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 2,
+      "lastAccessed": 1773525256298,
+      "keyFiles": [
+        "AS_RUN_TO_AS_WRITE_START.md",
+        "WRITE_AND_STORAGE_FLOW.md"
+      ]
+    },
+    "make_in": {
+      "path": "make_in",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1773525256298,
+      "keyFiles": [
+        "Makefile.in",
+        "Makefile.targets",
+        "Makefile.vars"
+      ]
+    },
+    "modules": {
+      "path": "modules",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1773525256298,
+      "keyFiles": []
+    },
+    "pkg": {
+      "path": "pkg",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1773525256299,
+      "keyFiles": []
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1773525256299,
+      "keyFiles": []
+    },
+    "tools": {
+      "path": "tools",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1773525256299,
+      "keyFiles": []
+    },
+    "tso": {
+      "path": "tso",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1773525256299,
+      "keyFiles": [
+        "Makefile",
+        "exclude_ce.txt",
+        "test.c",
+        "tso.cc"
+      ]
+    },
+    "apidocs/src": {
+      "path": "apidocs/src",
+      "purpose": "Source code",
+      "fileCount": 5,
+      "lastAccessed": 1773525256300,
+      "keyFiles": [
+        "doxyfile",
+        "footer.html",
+        "header.html"
+      ]
+    },
+    "as/src": {
+      "path": "as/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1773525256300,
+      "keyFiles": [
+        "Makefile"
+      ]
+    },
+    "cf/src": {
+      "path": "cf/src",
+      "purpose": "Source code",
+      "fileCount": 34,
+      "lastAccessed": 1773525256301,
+      "keyFiles": [
+        "Makefile",
+        "alloc.c",
+        "arenax.c"
+      ]
+    },
+    "pkg/dist": {
+      "path": "pkg/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 1,
+      "lastAccessed": 1773525256301,
+      "keyFiles": []
+    },
+    "pkg/src": {
+      "path": "pkg/src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1773525256301,
+      "keyFiles": [
+        "Makefile",
+        "git-cp-files.sh"
+      ]
+    },
+    "tools/bin": {
+      "path": "tools/bin",
+      "purpose": "Executable scripts",
+      "fileCount": 1,
+      "lastAccessed": 1773525256302,
+      "keyFiles": [
+        "asd-coldstart"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "as/src/storage/drv_ssd.c",
+      "accessCount": 86,
+      "lastAccessed": 1773527387365,
+      "type": "file"
+    },
+    {
+      "path": "as/src/transaction/write.c",
+      "accessCount": 47,
+      "lastAccessed": 1773526924777,
+      "type": "file"
+    },
+    {
+      "path": "as/src/base/service.c",
+      "accessCount": 33,
+      "lastAccessed": 1773527112898,
+      "type": "file"
+    },
+    {
+      "path": "as/src/base/thr_tsvc.c",
+      "accessCount": 28,
+      "lastAccessed": 1773527087072,
+      "type": "file"
+    },
+    {
+      "path": "cf/src/msg.c",
+      "accessCount": 25,
+      "lastAccessed": 1773526904155,
+      "type": "file"
+    },
+    {
+      "path": "as/src/transaction/rw_request.c",
+      "accessCount": 20,
+      "lastAccessed": 1773526901462,
+      "type": "file"
+    },
+    {
+      "path": "as/src/base/index.c",
+      "accessCount": 19,
+      "lastAccessed": 1773526784670,
+      "type": "file"
+    },
+    {
+      "path": "as/src/base/as.c",
+      "accessCount": 16,
+      "lastAccessed": 1773526560492,
+      "type": "file"
+    },
+    {
+      "path": "as/src/base/transaction.c",
+      "accessCount": 16,
+      "lastAccessed": 1773526590470,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 13,
+      "lastAccessed": 1773526018973,
+      "type": "directory"
+    },
+    {
+      "path": "as/src/base/set_index.c",
+      "accessCount": 12,
+      "lastAccessed": 1773526765621,
+      "type": "file"
+    },
+    {
+      "path": "as/src/storage/storage.c",
+      "accessCount": 10,
+      "lastAccessed": 1773526497792,
+      "type": "file"
+    },
+    {
+      "path": "cf/src/arenax.c",
+      "accessCount": 9,
+      "lastAccessed": 1773526629073,
+      "type": "file"
+    },
+    {
+      "path": "as",
+      "accessCount": 8,
+      "lastAccessed": 1773526115718,
+      "type": "directory"
+    },
+    {
+      "path": "as/src/transaction/read.c",
+      "accessCount": 8,
+      "lastAccessed": 1773526643415,
+      "type": "file"
+    },
+    {
+      "path": "cf/src/dynbuf.c",
+      "accessCount": 6,
+      "lastAccessed": 1773526511967,
+      "type": "file"
+    },
+    {
+      "path": "cf/src/cf_thread.c",
+      "accessCount": 5,
+      "lastAccessed": 1773526561030,
+      "type": "file"
+    },
+    {
+      "path": "cf",
+      "accessCount": 4,
+      "lastAccessed": 1773526067596,
+      "type": "directory"
+    },
+    {
+      "path": "as/src/base/main.c",
+      "accessCount": 3,
+      "lastAccessed": 1773526095359,
+      "type": "file"
+    },
+    {
+      "path": "as/include",
+      "accessCount": 1,
+      "lastAccessed": 1773526015954,
+      "type": "directory"
+    },
+    {
+      "path": "as/src/transaction/rw_utils.c",
+      "accessCount": 1,
+      "lastAccessed": 1773526067330,
+      "type": "file"
+    },
+    {
+      "path": "as/src/storage/drv_mem.c",
+      "accessCount": 1,
+      "lastAccessed": 1773526365054,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
